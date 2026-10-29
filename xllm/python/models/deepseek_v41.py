@@ -62,6 +62,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextvars import copy_context
 from dataclasses import dataclass, field, replace
 from datetime import timedelta
+from itertools import accumulate
 from typing import TYPE_CHECKING, Any, Optional, Sequence, Union
 
 import torch
@@ -3460,6 +3461,14 @@ class DeepseekV41VisionConfig:
         )
 
 
+# Packing several images into one TND attention call amortizes launch overhead
+# but loses FIA efficiency as the packed sequence grows, so it only wins while
+# the packed length stays bounded. Measured crossover is ~16k patches: below it
+# batching wins (2.0x at 4x32x32, 1.18x at 4x64x64, 1.09x for mixed sets),
+# above it regresses (0.88x at 4x96x96). Gate on the total packed length.
+_VISION_BATCH_MAX_TOTAL_PATCHES = 16384
+
+
 class DeepseekV41VisionNorm(nn.Module):
     """RMSNorm with fp32 weight and the vision eps (1e-6, not the text 1e-20)."""
 
@@ -3469,30 +3478,31 @@ class DeepseekV41VisionNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim, dtype=torch.float32, device=device))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        dtype = x.dtype
-        x = x.float()
-        x = x * torch.rsqrt(x.square().mean(-1, keepdim=True) + self.eps)
-        return (self.weight * x).to(dtype)
+        return _rms_norm(x, self.weight, self.eps)
 
 
-def _vision_cos_sin(
-    n_h: int, n_w: int, dim: int, theta: float, device: torch.device
-) -> tuple[torch.Tensor, torch.Tensor]:
-    inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim))
-    hpos = torch.arange(n_h, device=device).unsqueeze(1).expand(n_h, n_w)
-    wpos = torch.arange(n_w, device=device).unsqueeze(0).expand(n_h, n_w)
+def _vision_cos_sin(n_h: int, n_w: int, inv_freq: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    hpos = torch.arange(n_h, device=inv_freq.device).unsqueeze(1).expand(n_h, n_w)
+    wpos = torch.arange(n_w, device=inv_freq.device).unsqueeze(0).expand(n_h, n_w)
     freqs = torch.stack([hpos, wpos], dim=-1).reshape(-1, 2, 1).float()
     freqs = (freqs * inv_freq).flatten(1)
-    # Keep the rotary basis in float32: ``_apply_vision_rotary`` upcasts ``x`` to
+    # Keep the rotary basis in float32: the rotary kernel upcasts ``x`` to
     # float32 before multiplying, so rounding cos/sin to the model dtype first
     # would only lose precision for nothing.
     return freqs.cos().unsqueeze(1), freqs.sin().unsqueeze(1)
 
 
-def _apply_vision_rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    dtype = x.dtype
-    x1, x2 = x.float().chunk(2, dim=-1)
-    return torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1).to(dtype)
+def _vision_cos_sin_batch(
+    grids: list[tuple[int, int]], dim: int, theta: float, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Concatenate the per-image ``_vision_cos_sin`` half-width tables into one ``(sum T, 1, dim)`` pair."""
+    inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim))
+    cos_list, sin_list = [], []
+    for n_h, n_w in grids:
+        cos, sin = _vision_cos_sin(n_h, n_w, inv_freq)
+        cos_list.append(cos)
+        sin_list.append(sin)
+    return torch.cat(cos_list, dim=0), torch.cat(sin_list, dim=0)
 
 
 class DeepseekV41VisionAttention(nn.Module):
@@ -3503,15 +3513,25 @@ class DeepseekV41VisionAttention(nn.Module):
         self.wqkv = nn.Linear(cfg.hidden_size, 3 * cfg.num_heads * cfg.head_dim, bias=True, dtype=dtype, device=device)
         self.wo = nn.Linear(cfg.num_heads * cfg.head_dim, cfg.hidden_size, bias=True, dtype=dtype, device=device)
 
-    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, actual_seq: list[int]) -> torch.Tensor:
         n = x.size(0)
         q, k, v = (t.view(n, self.num_heads, self.head_dim) for t in self.wqkv(x).chunk(3, -1))
-        q = _apply_vision_rotary(q, cos, sin)
-        k = _apply_vision_rotary(k, cos, sin)
-        # One image per call: dense bidirectional attention, no varlen metadata.
-        q, k, v = (t.transpose(0, 1) for t in (q, k, v))
-        o = F.scaled_dot_product_attention(q, k, v)
-        return self.wo(o.transpose(0, 1).reshape(n, -1))
+        q = kernels.vision_rotary_mul(q.float(), cos, sin).to(q.dtype)
+        k = kernels.vision_rotary_mul(k.float(), cos, sin).to(k.dtype)
+        # Packed bidirectional attention: images are independent sequences, so
+        # ``actual_seq`` (cumulative per-image lengths) keeps them separate in a
+        # single TND call.
+        o = kernels.vision_fusion_attention(
+            q.contiguous(),
+            k.contiguous(),
+            v.contiguous(),
+            actual_seq_qlen=actual_seq,
+            actual_seq_kvlen=actual_seq,
+            num_heads=self.num_heads,
+            scale=self.head_dim**-0.5,
+            input_layout="TND",
+        )
+        return self.wo(o.reshape(n, -1))
 
 
 class DeepseekV41VisionMLP(nn.Module):
@@ -3522,9 +3542,7 @@ class DeepseekV41VisionMLP(nn.Module):
         self.w2 = nn.Linear(cfg.intermediate_size, cfg.hidden_size, bias=False, dtype=dtype, device=device)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate_up = self.w1(x)
-        gate, up = gate_up.chunk(2, -1)
-        return self.w2(F.silu(gate) * up)
+        return self.w2(kernels.silu_and_mul(self.w1(x)))
 
 
 class DeepseekV41VisionBlock(nn.Module):
@@ -3535,8 +3553,8 @@ class DeepseekV41VisionBlock(nn.Module):
         self.norm2 = DeepseekV41VisionNorm(cfg.hidden_size, cfg.norm_eps, device)
         self.mlp = DeepseekV41VisionMLP(cfg, dtype, device)
 
-    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn(self.norm1(x), cos, sin)
+    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, actual_seq: list[int]) -> torch.Tensor:
+        x = x + self.attn(self.norm1(x), cos, sin, actual_seq)
         return x + self.mlp(self.norm2(x))
 
 
@@ -3553,11 +3571,24 @@ class DeepseekV41VisionTower(nn.Module):
         self.blocks = nn.ModuleList(DeepseekV41VisionBlock(cfg, dtype, device) for _ in range(cfg.n_layers))
         self.norm = DeepseekV41VisionNorm(cfg.hidden_size, cfg.norm_eps, device)
 
-    def forward(self, patches: torch.Tensor, n_h: int, n_w: int) -> torch.Tensor:
+    def forward_batch(self, patches: torch.Tensor, grids: list[tuple[int, int]]) -> torch.Tensor:
+        """Run the ViT over several images in one pass.
+
+        ``patches`` is ``(sum(n_h*n_w), C, p, p)`` (concatenated per image, in
+        ``grids`` order); images stay independent via a packed TND attention
+        call, so the per-block attention launches collapse from one-per-image to
+        one-per-batch.
+        """
         x = self.patch_embed(patches.flatten(1))
-        cos, sin = _vision_cos_sin(n_h, n_w, self.rope_dim, self.cfg.rope_theta, x.device)
+        cos, sin = _vision_cos_sin_batch(grids, self.rope_dim, self.cfg.rope_theta, x.device)
+        # Expand the half-width tables to the full-width neox layout ONCE; every
+        # block's q/k rotary reuses them without a per-layer cat (qwen3_vl does
+        # the same).
+        cos = torch.cat([cos, cos], dim=-1).unsqueeze(0)
+        sin = torch.cat([sin, sin], dim=-1).unsqueeze(0)
+        actual_seq = list(accumulate(n_h * n_w for n_h, n_w in grids))
         for block in self.blocks:
-            x = block(x, cos, sin)
+            x = block(x, cos, sin, actual_seq)
         return self.norm(x)
 
 
@@ -3740,15 +3771,24 @@ class DeepseekV41ForCausalLM(PyModelBase):
                 f"[n_vit_h, n_vit_w], got shape {tuple(grid.shape)}"
             )
         r = self.vision_cfg.downsample_ratio
+        grids = [(int(row[-2]), int(row[-1])) for row in grid.tolist()]
+        if not grids:
+            return torch.empty(0)
+        sizes = [n_h * n_w for n_h, n_w in grids]
+        # Packed TND amortizes launch overhead for many small images but makes
+        # large images slower (see the constants above), so only batch then.
+        batch = len(grids) >= 2 and sum(sizes) <= _VISION_BATCH_MAX_TOTAL_PATCHES
+        vit = self.vision_model.forward_batch(patches, grids) if batch else None
         embeds = []
         offset = 0
-        for row in grid.tolist():
-            n_vit_h, n_vit_w = int(row[-2]), int(row[-1])
-            n_patches = n_vit_h * n_vit_w
-            image = patches[offset : offset + n_patches]
+        for (n_vit_h, n_vit_w), n_patches in zip(grids, sizes):
+            tower_out = (
+                vit[offset : offset + n_patches]
+                if batch
+                else self.vision_model.forward_batch(patches[offset : offset + n_patches], [(n_vit_h, n_vit_w)])
+            )
+            feats = self.aligner(tower_out, n_vit_h, n_vit_w)
             offset += n_patches
-            vit = self.vision_model(image, n_vit_h, n_vit_w)
-            feats = self.aligner(vit, n_vit_h, n_vit_w)
             n_llm_h = -(-n_vit_h // r)
             n_llm_w = -(-n_vit_w // r)
             rows = []
@@ -3764,7 +3804,7 @@ class DeepseekV41ForCausalLM(PyModelBase):
                 else:
                     rows.append(feats[feat_idx])
             embeds.append(torch.stack(rows))
-        return torch.cat(embeds, dim=0) if embeds else torch.empty(0)
+        return torch.cat(embeds, dim=0)
 
     # -- SupportsMultimodal protocol (xllm.python.models.multimodal) -------------
 
