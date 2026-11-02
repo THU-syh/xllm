@@ -80,24 +80,3 @@ target_link_libraries(batch_packed_input_test
                       $<$<BOOL:${USE_NPU}>:hccl>
                       $<$<BOOL:${USE_NPU}>:c_sec>
                       $<$<BOOL:${USE_NPU}>:nnopbase>)
-
-# Keep BatchFactory's first-use DP singleton separate from other batch tests.
-cc_test(
-  NAME
-    batch_factory_test
-  CPU_ONLY
-  SRCS
-    batch_factory_test.cpp
-  DEPS
-    :batch
-    GTest::gtest_main
-    $<$<BOOL:${USE_MLU}>:torch_mlu>
-    $<$<BOOL:${USE_NPU}>:torch_npu>
-)
-target_link_libraries(batch_factory_test
-                      PUBLIC
-                      Python::Python
-                      $<$<BOOL:${USE_NPU}>:ascendcl>
-                      $<$<BOOL:${USE_NPU}>:hccl>
-                      $<$<BOOL:${USE_NPU}>:c_sec>
-                      $<$<BOOL:${USE_NPU}>:nnopbase>)

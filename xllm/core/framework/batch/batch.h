@@ -20,10 +20,8 @@ limitations under the License.
 #include <absl/time/time.h>
 #include <torch/torch.h>
 
-#include <cstdint>
 #include <functional>
 #include <limits>
-#include <memory>
 #include <optional>
 #include <utility>
 #include <vector>
@@ -39,8 +37,6 @@ limitations under the License.
 namespace xllm {
 
 struct ModelArgs;
-struct SchedulingSample;
-class BatchFactory;
 class PreparedForwardInput;
 
 static uint64_t batch_counter_ = 1;
@@ -80,10 +76,6 @@ class Batch {
   }
 
   uint64_t batch_id() const { return batch_id_; }
-
-  const std::shared_ptr<SchedulingSample>& scheduling_sample() const {
-    return scheduling_sample_;
-  }
 
   void require_host_restore() { requires_host_restore_ = true; }
 
@@ -175,12 +167,6 @@ class Batch {
   std::vector<Sequence*> get_sequences() const;
 
  private:
-  friend class BatchFactory;
-
-  void set_scheduling_sample(std::shared_ptr<SchedulingSample> iteration) {
-    scheduling_sample_ = std::move(iteration);
-  }
-
   struct OutputTarget {
     Sequence* sequence = nullptr;
     size_t sample_id = 0;
@@ -228,15 +214,8 @@ class Batch {
 
   BatchForwardType batch_forward_type_;
 
-  std::shared_ptr<SchedulingSample> scheduling_sample_;
-
   uint64_t batch_id_ = UNINITIALIZED_BATCH_ID;
   bool requires_host_restore_ = false;
 };
-
-// Rec materialization uses internal unlimited budgets; retain its outer sample.
-void record_batch_scheduling(const std::vector<Batch>& batches,
-                             bool is_graph_warmup = false,
-                             bool use_outer_budget = false);
 
 }  // namespace xllm

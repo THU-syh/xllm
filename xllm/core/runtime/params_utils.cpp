@@ -17,7 +17,6 @@ limitations under the License.
 
 #include <torch/torch.h>
 
-#include <algorithm>
 #include <variant>
 
 #include "common/global_flags.h"
@@ -29,14 +28,6 @@ limitations under the License.
 #include "util/utils.h"
 
 namespace xllm {
-
-bool contains_graph_warmup(const std::vector<ForwardInput>& inputs) {
-  return std::any_of(
-      inputs.begin(), inputs.end(), [](const ForwardInput& input) {
-        return input.input_params.meta.is_graph_warmup;
-      });
-}
-
 torch::Tensor choose_lm_head_selected_token_idxes(
     const torch::Tensor& selected_token_idxes,
     const ModelInputParams& input_params,

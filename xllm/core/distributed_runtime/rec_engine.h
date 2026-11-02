@@ -139,8 +139,7 @@ class RecEngine : public Engine {
     ForwardOutput step(std::vector<Batch>& batches) override;
 
    private:
-    ForwardOutput get_model_output(const ForwardInput& model_inputs,
-                                   const std::vector<Batch>& batches);
+    ForwardOutput get_model_output(const ForwardInput& model_inputs);
   };
 
   // ============================================================
@@ -156,8 +155,7 @@ class RecEngine : public Engine {
     ForwardOutput step(std::vector<Batch>& batches) override;
 
    private:
-    ForwardOutput get_model_output(const ForwardInput& model_inputs,
-                                   const std::vector<Batch>& batches);
+    ForwardOutput get_model_output(const ForwardInput& model_inputs);
   };
 
   // ============================================================
@@ -178,8 +176,7 @@ class RecEngine : public Engine {
     size_t num_workers() const override;
 
    private:
-    ForwardOutput get_model_output(const ForwardInput& model_inputs,
-                                   const std::vector<Batch>& batches);
+    ForwardOutput get_model_output(const ForwardInput& model_inputs);
   };
 
   // Factory method to create pipeline (can access private classes)

@@ -45,14 +45,6 @@ limitations under the License.
 
 namespace xllm {
 
-FixedStepsScheduler::~FixedStepsScheduler() {
-  // Drain queued/running steps while their semaphore and scheduler state are
-  // still alive, before ContinuousScheduler closes the metrics registration.
-  // ThreadPool joins all workers; shutdown blocks if a task hangs. Returning
-  // after a timeout would let tasks capturing this access destroyed state.
-  step_threadpool_.reset();
-}
-
 FixedStepsScheduler::FixedStepsScheduler(Engine* engine, const Options& options)
     : ContinuousScheduler(engine, options),
       step_semaphore_(
@@ -192,7 +184,6 @@ void FixedStepsScheduler::handle_prefill_requests(
 std::vector<Batch> FixedStepsScheduler::prepare_batch() {
   const size_t ingress_request_count = begin_schedule_round();
   Timer timer;
-  auto sample = create_scheduling_sample();
   // propagate new requests to prefill_queue_
   // Include those requests that are preempted by others.
   auto propagate_request = [this](std::shared_ptr<Request>& request) {
@@ -286,16 +277,14 @@ std::vector<Batch> FixedStepsScheduler::prepare_batch() {
   // Use pipeline to create batches
   std::vector<Batch> batches;
   if (scheduler_pipeline_) {
-    batches = scheduler_pipeline_->create_batches(
-        *this, batch_factory, std::move(sample));
+    batches = scheduler_pipeline_->create_batches(*this, batch_factory);
   } else {
     // Fallback for empty requests
     batches = batch_factory->create_rec_batches(
         running_requests_,
         running_sequences_,
         running_sequences_budgets_,
-        kv_cache_manager_->get_swap_block_transfer_infos(),
-        std::move(sample));
+        kv_cache_manager_->get_swap_block_transfer_infos());
   }
 
   // update metrics before returning
@@ -367,7 +356,7 @@ ScheduleResult FixedStepsScheduler::schedule_request(
                                absl::ToChronoNanoseconds(deadline - now);
     prefetch_request(wait_deadline);
   }
-  record_empty_scheduling_round(result.batches);
+  // return empty result
   return result;
 }
 
@@ -385,25 +374,12 @@ void FixedStepsScheduler::step(const absl::Duration& timeout) {
       return;
     }
 
-    const auto wait_started_at = std::chrono::steady_clock::now();
-    if (options_.rec_worker_max_concurrency() > 1) {
-      step_semaphore_.acquire();
-    }
     // Submit task to thread pool for asynchronous execution
     // After engine_->step() completes, process finished/cancelled requests
     auto function = [this,
-                     wait_started_at,
                      batches = std::move(result.batches),
                      requests = std::move(result.requests),
                      sequences = std::move(result.sequences)]() mutable {
-      if (options_.rec_worker_max_concurrency() > 1) {
-        const auto& sample = batches.front().scheduling_sample();
-        CHECK(sample != nullptr);
-        // At task entry this includes both semaphore and threadpool waiting.
-        // Engine input preparation remains part of the local submit latency.
-        sample->excluded_wait =
-            std::chrono::steady_clock::now() - wait_started_at;
-      }
       // Surface each internal RecEngine output batch, including non-stream
       // requests. The frontend records receipt before any final output task.
       const auto observed_requests =
@@ -447,7 +423,8 @@ void FixedStepsScheduler::step(const absl::Duration& timeout) {
     };
 
     if (options_.rec_worker_max_concurrency() > 1) {
-      step_threadpool_->schedule(std::move(function));
+      step_semaphore_.acquire();
+      step_threadpool_->schedule(function);
     } else {
       function();
     }
@@ -462,14 +439,12 @@ void FixedStepsScheduler::step(const absl::Duration& timeout) {
 // Pipeline implementations
 std::vector<Batch> FixedStepsScheduler::LlmRecSchedulerPipeline::create_batches(
     FixedStepsScheduler& scheduler,
-    BatchFactory* batch_factory,
-    std::shared_ptr<SchedulingSample> sample) {
+    BatchFactory* batch_factory) {
   return batch_factory->create_batches(
       scheduler.running_requests_,
       scheduler.running_sequences_,
       scheduler.running_sequences_budgets_,
-      scheduler.kv_cache_manager_->get_swap_block_transfer_infos(),
-      std::move(sample));
+      scheduler.kv_cache_manager_->get_swap_block_transfer_infos());
 }
 
 bool FixedStepsScheduler::LlmRecSchedulerPipeline::allocate_kv_cache(
@@ -489,27 +464,23 @@ bool FixedStepsScheduler::LlmRecSchedulerPipeline::allocate_kv_cache(
 
 std::vector<Batch> FixedStepsScheduler::OneRecSchedulerPipeline::create_batches(
     FixedStepsScheduler& scheduler,
-    BatchFactory* batch_factory,
-    std::shared_ptr<SchedulingSample> sample) {
+    BatchFactory* batch_factory) {
   return batch_factory->create_rec_batches(
       scheduler.running_requests_,
       scheduler.running_sequences_,
       scheduler.running_sequences_budgets_,
-      scheduler.kv_cache_manager_->get_swap_block_transfer_infos(),
-      std::move(sample));
+      scheduler.kv_cache_manager_->get_swap_block_transfer_infos());
 }
 
 std::vector<Batch>
 FixedStepsScheduler::OneRecXAttentionSchedulerPipeline::create_batches(
     FixedStepsScheduler& scheduler,
-    BatchFactory* batch_factory,
-    std::shared_ptr<SchedulingSample> sample) {
+    BatchFactory* batch_factory) {
   return batch_factory->create_rec_batches(
       scheduler.running_requests_,
       scheduler.running_sequences_,
       scheduler.running_sequences_budgets_,
-      scheduler.kv_cache_manager_->get_swap_block_transfer_infos(),
-      std::move(sample));
+      scheduler.kv_cache_manager_->get_swap_block_transfer_infos());
 }
 
 bool FixedStepsScheduler::OneRecXAttentionSchedulerPipeline::allocate_kv_cache(
@@ -537,14 +508,12 @@ bool FixedStepsScheduler::OneRecXAttentionSchedulerPipeline::allocate_kv_cache(
 std::vector<Batch>
 FixedStepsScheduler::RecMultiRoundSchedulerPipeline::create_batches(
     FixedStepsScheduler& scheduler,
-    BatchFactory* batch_factory,
-    std::shared_ptr<SchedulingSample> sample) {
+    BatchFactory* batch_factory) {
   return batch_factory->create_batches(
       scheduler.running_requests_,
       scheduler.running_sequences_,
       scheduler.running_sequences_budgets_,
-      scheduler.kv_cache_manager_->get_swap_block_transfer_infos(),
-      std::move(sample));
+      scheduler.kv_cache_manager_->get_swap_block_transfer_infos());
 }
 
 std::unique_ptr<FixedStepsScheduler::SchedulerPipeline>

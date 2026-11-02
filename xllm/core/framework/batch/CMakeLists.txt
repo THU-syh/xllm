@@ -30,6 +30,5 @@ cc_library(
     :common
     :mposition
     glog::glog
-    absl::flat_hash_map
     xxHash
 )

@@ -447,7 +447,7 @@ ForwardOutput VLMEngine::step(std::vector<Batch>& batch) {
   }
   if (fits) {
     batch = std::move(candidate_batch);
-    execute_batch(batch, std::move(prepared_inputs), batch);
+    execute_batch(batch, std::move(prepared_inputs));
     COUNTER_ADD(engine_latency_seconds, timer.elapsed_seconds());
     return {};
   }
@@ -474,7 +474,7 @@ ForwardOutput VLMEngine::step(std::vector<Batch>& batch) {
     if (std::any_of(batch.begin(), batch.end(), [](const Batch& b) {
           return !b.empty();
         })) {
-      execute_batch(batch, prepare_inputs(batch), batch);
+      execute_batch(batch, prepare_inputs(batch));
     }
     return {};
   }
@@ -527,7 +527,7 @@ ForwardOutput VLMEngine::step(std::vector<Batch>& batch) {
         // Empty ranks change DP globals; rebuild only on this rejection path.
         sub_inputs = prepare_inputs(sub_batch);
       }
-      execute_batch(sub_batch, std::move(sub_inputs), batch);
+      execute_batch(sub_batch, std::move(sub_inputs));
     }
   }
   // Beam updates can replace sequences in the shared groups. Rebuild the
@@ -558,9 +558,9 @@ std::vector<uint64_t> VLMEngine::forward_input_sizes(
              << "; worker state is not recoverable, restart the worker group";
 }
 
-void VLMEngine::execute_batch(std::vector<Batch>& batch,
-                              std::vector<PreparedForwardInput> prepared_inputs,
-                              const std::vector<Batch>& scheduling_batch) {
+void VLMEngine::execute_batch(
+    std::vector<Batch>& batch,
+    std::vector<PreparedForwardInput> prepared_inputs) {
   std::vector<ForwardInput> forward_inputs;
   forward_inputs.reserve(prepared_inputs.size());
   for (size_t dp_rank = 0; dp_rank < prepared_inputs.size(); ++dp_rank) {
@@ -588,10 +588,6 @@ void VLMEngine::execute_batch(std::vector<Batch>& batch,
 
   std::vector<folly::SemiFuture<std::optional<RawForwardOutput>>> futures;
   futures.reserve(worker_clients_num_);
-
-  const bool is_graph_warmup = contains_graph_warmup(forward_inputs);
-  // Request splits execute separately but share one full scheduling sample.
-  record_batch_scheduling(scheduling_batch, is_graph_warmup);
 
   // update dp related global parameters and then execute model
   for (int32_t worker_rank = 0; worker_rank < worker_clients_num_;

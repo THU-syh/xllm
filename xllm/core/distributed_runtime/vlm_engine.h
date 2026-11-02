@@ -64,8 +64,7 @@ class VLMEngine : public Engine {
   bool allocate_kv_cache(const KVCacheCapacity& kv_cache_cap);
   std::vector<PreparedForwardInput> prepare_inputs(std::vector<Batch>& batch);
   void execute_batch(std::vector<Batch>& batch,
-                     std::vector<PreparedForwardInput> prepared_inputs,
-                     const std::vector<Batch>& scheduling_batch);
+                     std::vector<PreparedForwardInput> prepared_inputs);
   std::vector<uint64_t> forward_input_sizes(
       const std::vector<PreparedForwardInput>& inputs) const;
   [[noreturn]] void abort_execution(const std::string& reason);

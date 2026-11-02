@@ -20,11 +20,8 @@ limitations under the License.
 
 #include <algorithm>
 #include <chrono>
-#include <future>
-#include <latch>
 #include <optional>
 #include <string>
-#include <thread>
 
 #include "common/metrics.h"
 #include "continuous_scheduler.h"
@@ -32,7 +29,6 @@ limitations under the License.
 #include "core/framework/config/scheduler_config.h"
 #include "distributed_runtime/engine.h"
 #include "framework/request/rec_type.h"
-#include "util/scope_guard.h"
 
 namespace xllm {
 
@@ -44,26 +40,6 @@ class FixedStepsSchedulerTestPeer final {
 
   static void report_queues(FixedStepsScheduler& scheduler) {
     scheduler.report_request_queue_metrics();
-  }
-  static void occupy_slots(FixedStepsScheduler& scheduler) {
-    scheduler.step_semaphore_.acquire();
-    scheduler.step_semaphore_.acquire();
-  }
-  static void release_slots(FixedStepsScheduler& scheduler) {
-    scheduler.step_semaphore_.release(2);
-  }
-  static void drain_workers(FixedStepsScheduler& scheduler) {
-    scheduler.step_threadpool_.reset();
-  }
-  static void occupy_workers(FixedStepsScheduler& scheduler,
-                             std::latch& entered,
-                             std::latch& resume) {
-    for (int32_t i = 0; i < 2; ++i) {
-      scheduler.step_threadpool_->schedule([&] {
-        entered.count_down();
-        resume.wait();
-      });
-    }
   }
 };
 
@@ -149,24 +125,6 @@ class FakeEngine : public Engine {
  private:
   std::unique_ptr<Tokenizer> fake_tokenizer_;
   std::unique_ptr<BlockManagerPool> fake_block_manager_;
-};
-
-class SchedulingEngine final : public FakeEngine {
- public:
-  SchedulingEngine() : FakeEngine(/*num_blocks=*/32, /*block_size=*/4) {}
-  ForwardOutput step(std::vector<Batch>& batches) override {
-    entered_at_ = std::chrono::steady_clock::now();
-    record_batch_scheduling(
-        batches, /*is_graph_warmup=*/false, /*use_outer_budget=*/true);
-    record_batch_scheduling(
-        batches, /*is_graph_warmup=*/false, /*use_outer_budget=*/true);
-    recorded_at_ = std::chrono::steady_clock::now();
-    observed_.set_value(batches.front().scheduling_sample());
-    return {};
-  }
-  std::promise<std::shared_ptr<SchedulingSample>> observed_;
-  std::chrono::steady_clock::time_point entered_at_;
-  std::chrono::steady_clock::time_point recorded_at_;
 };
 
 template <typename T>
@@ -627,104 +585,6 @@ TEST(FixedStepsSchedulerTest, PrepareBatchRespectsTokenBudget) {
   ContinuousScheduler* base = &scheduler;
   base->prepare_batch_test();
   EXPECT_LE(base->get_running_requests().size(), 1u);
-}
-
-TEST(FixedStepsSchedulerMetricsTest, RecordsOneEmptySampleAfterBlockingWait) {
-  SchedulingEngine engine;
-  auto options = CreateOptions(/*max_tokens_per_batch=*/8,
-                               /*max_seqs_per_batch=*/1,
-                               /*dp_size=*/1,
-                               /*enable_schedule_overlap=*/false,
-                               /*rec_worker_max_concurrency=*/1);
-  options.server_idx(745);
-  FixedStepsScheduler scheduler(&engine, options);
-  scheduler.step(absl::Milliseconds(1));
-  EXPECT_EQ(MULTI_HISTOGRAM_scheduling_latency_microseconds
-                .get_stats({"745", "empty"})
-                ->count(),
-            1);
-}
-
-TEST(FixedStepsSchedulerMetricsTest, ExcludesSlotAndThreadpoolWait) {
-  ScopedConfigValue<bool> prefix_cache(
-      KVCacheConfig::get_instance().enable_prefix_cache(), false);
-  for (const bool queued : {false, true}) {
-    SCOPED_TRACE(queued);
-    SchedulingEngine engine;
-    auto options = CreateOptions(/*max_tokens_per_batch=*/8,
-                                 /*max_seqs_per_batch=*/1,
-                                 /*dp_size=*/1,
-                                 /*enable_schedule_overlap=*/false,
-                                 /*rec_worker_max_concurrency=*/2);
-    const std::string server = queued ? "742" : "741";
-    options.server_idx(queued ? 742 : 741);
-    FixedStepsScheduler scheduler(&engine, options);
-    std::latch workers_entered(2);
-    std::latch resume_workers(1);
-    if (queued) {
-      FixedStepsSchedulerTestPeer::occupy_workers(
-          scheduler, workers_entered, resume_workers);
-      workers_entered.wait();
-    } else {
-      FixedStepsSchedulerTestPeer::occupy_slots(scheduler);
-    }
-    auto release = [&] {
-      if (queued) {
-        resume_workers.count_down();
-      } else {
-        FixedStepsSchedulerTestPeer::release_slots(scheduler);
-      }
-    };
-    std::future<void> step;
-    ScopeGuard drain([&] {
-      if (step.valid()) {
-        step.wait();
-      }
-      FixedStepsSchedulerTestPeer::drain_workers(scheduler);
-    });
-    ScopeGuard unblock(release);
-    auto requests = GenRequests({4}, {4}, RecType::kOneRec);
-    ASSERT_TRUE(scheduler.add_request(requests.front()));
-    const double prompt_before =
-        COUNTER_VALUE(num_processing_tokens_total_prompt);
-    auto observed = engine.observed_.get_future();
-    step = std::async(std::launch::async,
-                      [&] { scheduler.step(absl::ZeroDuration()); });
-    const auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds(5);
-    while (COUNTER_VALUE(num_processing_tokens_total_prompt) == prompt_before &&
-           std::chrono::steady_clock::now() < deadline) {
-      std::this_thread::yield();
-    }
-    ASSERT_GT(COUNTER_VALUE(num_processing_tokens_total_prompt), prompt_before);
-    EXPECT_EQ(observed.wait_for(std::chrono::milliseconds(50)),
-              std::future_status::timeout);
-    release();
-    unblock.dismiss();
-    ASSERT_EQ(observed.wait_for(std::chrono::seconds(5)),
-              std::future_status::ready);
-    auto sample = observed.get();
-    step.get();
-    EXPECT_GT(sample->excluded_wait,
-              std::chrono::steady_clock::duration::zero());
-    const double before_us =
-        std::chrono::duration<double, std::micro>(
-            engine.entered_at_ - sample->started_at - sample->excluded_wait)
-            .count();
-    const double after_us =
-        std::chrono::duration<double, std::micro>(
-            engine.recorded_at_ - sample->started_at - sample->excluded_wait)
-            .count();
-    const double latest = MULTI_GAUGE_scheduling_latency_microseconds_latest
-                              .get_stats({server, "submitted"})
-                              ->get_value();
-    EXPECT_GE(latest, before_us);
-    EXPECT_LE(latest, after_us);
-    EXPECT_EQ(MULTI_HISTOGRAM_scheduling_latency_microseconds
-                  .get_stats({server, "submitted"})
-                  ->count(),
-              1);
-  }
 }
 
 TEST(FixedStepsSchedulerTest, StepCompletesWithRequest) {

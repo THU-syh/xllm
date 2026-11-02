@@ -15,12 +15,6 @@ limitations under the License.
 
 #include "batch_factory.h"
 
-#include <absl/container/flat_hash_map.h>
-
-#include <numeric>
-
-#include "common/metrics.h"
-
 namespace xllm {
 
 namespace {
@@ -33,86 +27,18 @@ bool is_beam_search(const std::vector<std::shared_ptr<Request>>& requests) {
   }
   return false;
 }
-// Non-owning Request identities are needed only while classifying this batch.
-class BatchWorkloadCollector final {
- public:
-  BatchWorkloadCollector(const std::vector<std::shared_ptr<Request>>& requests,
-                         int32_t dp_size,
-                         SchedulingSample* sample) {
-    if (sample == nullptr) {
-      return;
-    }
-    sample->workloads.resize(dp_size);
-    workloads_ = &sample->workloads;
-    num_requests_ = requests.size();
-    request_stages_.resize(static_cast<size_t>(dp_size) * num_requests_);
-    const size_t num_sequences =
-        std::accumulate(requests.begin(),
-                        requests.end(),
-                        size_t{0},
-                        [](size_t count, const auto& request) {
-                          return count + request->sequences().size();
-                        });
-    sequence_owners_.reserve(num_sequences);
-    for (size_t index = 0; index < requests.size(); ++index) {
-      for (const auto& sequence : requests[index]->sequences()) {
-        sequence_owners_.emplace(sequence.get(), index);
-      }
-    }
-  }
-
-  void record(const Sequence* sequence,
-              size_t prompt_tokens,
-              size_t decode_tokens) {
-    if (workloads_ == nullptr) {
-      return;
-    }
-    const int32_t dp = sequence->dp_rank();
-    CHECK_GE(dp, 0);
-    CHECK_LT(static_cast<size_t>(dp), workloads_->size());
-    const auto owner = sequence_owners_.find(sequence);
-    CHECK(owner != sequence_owners_.end());
-    const size_t stage_index =
-        static_cast<size_t>(dp) * num_requests_ + owner->second;
-    SchedulingWorkload& workload = (*workloads_)[dp];
-    workload.prompt_tokens += static_cast<int64_t>(prompt_tokens);
-    workload.decode_tokens += static_cast<int64_t>(decode_tokens);
-    uint8_t& stages = request_stages_[stage_index];
-    if (prompt_tokens > 0 && (stages & kPrefill) == 0) {
-      stages |= kPrefill;
-      ++workload.prefill_requests;
-    }
-    if (decode_tokens > 0 && (stages & kDecode) == 0) {
-      stages |= kDecode;
-      ++workload.decode_requests;
-    }
-  }
-
- private:
-  static constexpr uint8_t kPrefill = 1;
-  static constexpr uint8_t kDecode = 2;
-  std::vector<SchedulingWorkload>* workloads_ = nullptr;
-  absl::flat_hash_map<const Sequence*, size_t> sequence_owners_;
-  // One byte per (DP, Request). Count cross-DP requests independently.
-  std::vector<uint8_t> request_stages_;
-  size_t num_requests_ = 0;
-};
-
 }  // namespace
 
 std::vector<Batch> BatchFactory::create_batches(
     const std::vector<std::shared_ptr<Request>>& running_requests,
     const std::vector<Sequence*>& running_sequences,
     const std::vector<size_t>& running_sequences_budgets,
-    std::vector<std::vector<BlockTransferInfo>>* swap_block_transfer_infos,
-    std::shared_ptr<SchedulingSample> sample) {
+    std::vector<std::vector<BlockTransferInfo>>* swap_block_transfer_infos) {
   size_t num_prompt_tokens = 0;
   size_t num_generated_tokens = 0;
   std::vector<Batch> batches(dp_size_);
-  BatchWorkloadCollector workload_collector(
-      running_requests, dp_size_, sample.get());
   for (size_t i = 0; i < running_sequences.size(); ++i) {
-    Sequence* sequence = running_sequences[i];
+    auto* sequence = running_sequences[i];
     const size_t token_budget = running_sequences_budgets[i];
 
     const size_t remaining_prompt_tokens =
@@ -126,7 +52,6 @@ std::vector<Batch> BatchFactory::create_batches(
     const size_t generated_tokens = token_budget - prompt_tokens;
     num_prompt_tokens += prompt_tokens;
     num_generated_tokens += generated_tokens;
-    workload_collector.record(sequence, prompt_tokens, generated_tokens);
 
     // if dp enabled, each sequence is required to
     // dispatch to the same rank in the whole lifetime
@@ -141,8 +66,7 @@ std::vector<Batch> BatchFactory::create_batches(
     }
   }
 
-  for (int32_t i = 0; i < dp_size_; i++) {
-    batches[i].set_scheduling_sample(sample);
+  for (int i = 0; i < dp_size_; i++) {
     if (batches[i].empty()) {
       continue;
     }
@@ -173,15 +97,12 @@ std::vector<Batch> BatchFactory::create_rec_batches(
     const std::vector<std::shared_ptr<Request>>& running_requests,
     const std::vector<Sequence*>& running_sequences,
     const std::vector<size_t>& running_sequences_budgets,
-    std::vector<std::vector<BlockTransferInfo>>* swap_block_transfer_infos,
-    std::shared_ptr<SchedulingSample> sample) {
+    std::vector<std::vector<BlockTransferInfo>>* swap_block_transfer_infos) {
   size_t num_prompt_tokens = 0;
   size_t num_generated_tokens = 0;
   std::vector<Batch> batches(dp_size_);
-  BatchWorkloadCollector workload_collector(
-      running_requests, dp_size_, sample.get());
   for (size_t i = 0; i < running_sequences.size(); ++i) {
-    Sequence* sequence = running_sequences[i];
+    auto* sequence = running_sequences[i];
     const size_t token_budget = running_sequences_budgets[i];
 
     const size_t remaining_prompt_tokens =
@@ -195,7 +116,6 @@ std::vector<Batch> BatchFactory::create_rec_batches(
     const size_t generated_tokens = token_budget - prompt_tokens;
     num_prompt_tokens += prompt_tokens;
     num_generated_tokens += generated_tokens;
-    workload_collector.record(sequence, prompt_tokens, generated_tokens);
 
     batches[sequence->dp_rank()].set_batch_id();
   }
@@ -206,8 +126,7 @@ std::vector<Batch> BatchFactory::create_rec_batches(
     batches[dp_rank].add(seq_group);
   }
 
-  for (int32_t i = 0; i < dp_size_; i++) {
-    batches[i].set_scheduling_sample(sample);
+  for (int i = 0; i < dp_size_; i++) {
     if (batches[i].empty()) {
       continue;
     }

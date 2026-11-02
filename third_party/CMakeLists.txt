@@ -3,7 +3,6 @@ include(cc_library)
 add_subdirectory(sentencepiece)
 add_subdirectory(minja)
 add_subdirectory(brpc)
-
 add_subdirectory(smhasher/src)
 add_subdirectory(cpprestsdk)
 if(USE_MUSA AND TARGET cpprest)

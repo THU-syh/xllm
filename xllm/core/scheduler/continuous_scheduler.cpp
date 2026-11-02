@@ -141,13 +141,11 @@ void report_kv_cache_metrics(const KVCacheManager& kv_cache_manager) {
 
 ContinuousScheduler::ContinuousScheduler(Engine* engine, const Options& options)
     : options_(options),
-      scheduling_metrics_(std::make_shared<SchedulingMetricState>()),
       server_label_(std::to_string(options.server_idx())),
       batch_mode_(resolve_batch_mode(options)),
       engine_(engine),
       request_queue_(::xllm::RecConfig::get_instance().request_queue_size()) {
   CHECK(engine_ != nullptr);
-  scheduling_metrics_->server = server_label_;
 
   // UnifiedPolicy's mixed prefill/decode redistribution can trim or re-admit a
   // chunk independently of the LINEAR checkpoint boundary. LINEAR state can
@@ -285,7 +283,6 @@ ContinuousScheduler::~ContinuousScheduler() {
     engine_->update_last_step_result(last_batch_);
     last_batch_.clear();
   }
-  close_scheduling_metrics(*scheduling_metrics_);
   running_requests_.clear();
   for (const auto& [queue_name, metric] : request_queue_metrics_) {
     metric->set_value(0.0);
@@ -461,25 +458,6 @@ void ContinuousScheduler::drain_decode_restore_waiting(
   }
 }
 
-std::shared_ptr<SchedulingSample>
-ContinuousScheduler::create_scheduling_sample() {
-  auto sample = std::make_shared<SchedulingSample>();
-  sample->metrics = scheduling_metrics_;
-  return sample;
-}
-
-void ContinuousScheduler::record_empty_scheduling_round(
-    const std::vector<Batch>& batches) {
-  if (batches.empty() || batches.front().scheduling_sample() == nullptr) {
-    return;
-  }
-  // Only the final prepare attempt is sampled. Its sample starts after the
-  // preceding retry/sleep, and no idle wait follows it before this empty
-  // return.
-  record_scheduling_metrics(*batches.front().scheduling_sample(),
-                            /*empty=*/true);
-}
-
 size_t ContinuousScheduler::begin_schedule_round() {
   const size_t ingress_request_count =
       static_cast<size_t>(std::max<ssize_t>(request_queue_.size(), 0));
@@ -490,7 +468,6 @@ size_t ContinuousScheduler::begin_schedule_round() {
 std::vector<Batch> ContinuousScheduler::prepare_batch() {
   const size_t ingress_request_count = begin_schedule_round();
   Timer timer;
-  auto sample = create_scheduling_sample();
   auto state = make_state();
   state.ingress_request_count = ingress_request_count;
 
@@ -555,8 +532,7 @@ std::vector<Batch> ContinuousScheduler::prepare_batch() {
           ->create_batches(running_requests_,
                            running_sequences_,
                            running_sequences_budgets_,
-                           kv_cache_manager_->get_swap_block_transfer_infos(),
-                           std::move(sample));
+                           kv_cache_manager_->get_swap_block_transfer_infos());
 
   bool is_batches_empty = std::all_of(
       batches.begin(), batches.end(), [](const Batch& b) { return b.empty(); });
@@ -623,7 +599,6 @@ std::vector<Batch> ContinuousScheduler::schedule_request(
         std::any_of(last_batch_.begin(),
                     last_batch_.end(),
                     [](const Batch& pending) { return !pending.empty(); })) {
-      record_empty_scheduling_round(batch);
       return batch;
     }
 
@@ -642,8 +617,7 @@ std::vector<Batch> ContinuousScheduler::schedule_request(
         std::min(absl::Milliseconds(kStepSleepTimeMs), deadline - now);
     absl::SleepFor(time_to_sleep);
   }
-  // One empty observation per schedule_request, after all idle retries.
-  record_empty_scheduling_round(batch);
+  // return an empty batch
   return batch;
 }
 

@@ -18,15 +18,10 @@ limitations under the License.
 #include <bvar/bvar.h>
 #include <bvar/multi_dimension.h>
 
-#include <array>
-#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <initializer_list>
-#include <memory>
-#include <mutex>
 #include <string>
-#include <vector>
 
 #include "common/macros.h"
 #include "util/timer.h"
@@ -34,34 +29,6 @@ limitations under the License.
 namespace xllm {
 
 using bvar::Adder;
-
-// Per-DP work selected before input preparation advances the KV state.
-struct SchedulingWorkload {
-  int64_t prompt_tokens = 0;
-  int64_t decode_tokens = 0;
-  int64_t prefill_requests = 0;
-  int64_t decode_requests = 0;
-};
-
-struct SchedulingMetricState {
-  std::mutex mutex;
-  std::string server;
-  std::array<std::chrono::steady_clock::time_point, 2> latest_at{};
-  bool closed = false;
-};
-
-// One execution task owns each sample; repeated Rec forwards record it once.
-struct SchedulingSample {
-  std::chrono::steady_clock::time_point started_at =
-      std::chrono::steady_clock::now();
-  std::shared_ptr<SchedulingMetricState> metrics;
-  std::vector<SchedulingWorkload> workloads;
-  std::chrono::steady_clock::duration excluded_wait{};
-  bool recorded = false;
-};
-
-void record_scheduling_metrics(SchedulingSample& sample, bool empty = false);
-void close_scheduling_metrics(SchedulingMetricState& state);
 
 struct RequestTimingSnapshot;
 
@@ -347,18 +314,6 @@ DECLARE_GAUGE(num_blocks_in_prefix_cache);
 DECLARE_GAUGE(num_free_blocks);
 DECLARE_GAUGE(num_used_blocks);
 DECLARE_COUNTER(scheduling_latency_seconds);
-// Counts failed submission checks, not unique scheduling rounds.
-DECLARE_COUNTER(scheduling_sample_mismatch_total);
-// Native LatencyRecorder provides window mean/P99, count and QPS.
-// Latency window samples and latest values are both in microseconds.
-DECLARE_MULTI_HISTOGRAM(scheduling_latency_microseconds);
-DECLARE_MULTI_GAUGE(scheduling_latency_microseconds_latest);
-// Workload windows record tokens/round or Requests/round, not time or totals.
-// Recorder count/qps represent sampled rounds and rounds/second.
-DECLARE_MULTI_HISTOGRAM(scheduling_workload_tokens);
-DECLARE_MULTI_HISTOGRAM(scheduling_workload_requests);
-DECLARE_MULTI_GAUGE(scheduling_workload_tokens_latest);
-DECLARE_MULTI_GAUGE(scheduling_workload_requests_latest);
 
 // total number of processing tokens
 DECLARE_COUNTER(num_processing_tokens_total_prompt);

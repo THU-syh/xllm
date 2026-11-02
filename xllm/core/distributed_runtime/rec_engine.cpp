@@ -472,8 +472,6 @@ ForwardOutput RecEngine::LlmRecEnginePipeline::step(
     std::vector<folly::SemiFuture<std::optional<RawForwardOutput>>> futures;
     futures.reserve(engine_.worker_clients_num_);
 
-    const bool is_graph_warmup = contains_graph_warmup(forward_inputs);
-    record_batch_scheduling(batches, is_graph_warmup);
     timer.reset();
     for (size_t worker_rank = 0; worker_rank < engine_.worker_clients_num_;
          ++worker_rank) {
@@ -756,7 +754,7 @@ ForwardOutput RecEngine::OneRecPrefillOnlyEnginePipeline::step(
   }
 
   timer.reset();
-  const auto& prefill_output = get_model_output(forward_inputs, batches);
+  const auto& prefill_output = get_model_output(forward_inputs);
   HISTOGRAM_OBSERVE(rec_first_token_latency_microseconds,
                     timer.elapsed_microseconds());
 
@@ -774,7 +772,7 @@ ForwardOutput RecEngine::OneRecPrefillOnlyEnginePipeline::step(
                       timer.elapsed_microseconds());
 
     timer.reset();
-    decode_output = get_model_output(forward_inputs, batches);
+    decode_output = get_model_output(forward_inputs);
     if (i == 0) {
       HISTOGRAM_OBSERVE(rec_second_token_latency_microseconds,
                         timer.elapsed_microseconds());
@@ -802,13 +800,9 @@ ForwardOutput RecEngine::OneRecPrefillOnlyEnginePipeline::step(
 }
 
 ForwardOutput RecEngine::OneRecPrefillOnlyEnginePipeline::get_model_output(
-    const ForwardInput& model_inputs,
-    const std::vector<Batch>& batches) {
+    const ForwardInput& model_inputs) {
   std::vector<folly::SemiFuture<std::optional<ForwardOutput>>> futures;
   futures.reserve(engine_.workers_.size());
-  record_batch_scheduling(batches,
-                          model_inputs.input_params.meta.is_graph_warmup,
-                          /*use_outer_budget=*/true);
   for (auto& worker : engine_.workers_) {
     futures.emplace_back(worker->step_async(model_inputs));
   }
@@ -904,7 +898,7 @@ ForwardOutput RecEngine::OneRecXAttentionEnginePipeline::step(
   }
 
   timer.reset();
-  const auto& output = get_model_output(forward_inputs, batches);
+  const auto& output = get_model_output(forward_inputs);
   HISTOGRAM_OBSERVE(rec_first_token_latency_microseconds,
                     timer.elapsed_microseconds());
 
@@ -923,8 +917,7 @@ ForwardOutput RecEngine::OneRecXAttentionEnginePipeline::step(
 }
 
 ForwardOutput RecEngine::OneRecXAttentionEnginePipeline::get_model_output(
-    const ForwardInput& model_inputs,
-    const std::vector<Batch>& batches) {
+    const ForwardInput& model_inputs) {
   const bool trace_engine_output =
       util::get_bool_env("XLLM_DEBUG_ONEREC_ENGINE_TRACE", false);
   const bool trace_stage_timing =
@@ -949,9 +942,6 @@ ForwardOutput RecEngine::OneRecXAttentionEnginePipeline::get_model_output(
   };
   std::vector<folly::SemiFuture<std::optional<ForwardOutput>>> futures;
   futures.reserve(engine_.workers_.size());
-  record_batch_scheduling(batches,
-                          model_inputs.input_params.meta.is_graph_warmup,
-                          /*use_outer_budget=*/true);
   for (auto& worker : engine_.workers_) {
     futures.emplace_back(worker->step_async(model_inputs));
   }
@@ -1201,7 +1191,7 @@ ForwardOutput RecEngine::RecMultiRoundEnginePipeline::step(
 
   timer.reset();
   // Execute model inference (only one step, multi-round handled by worker)
-  const auto& output = get_model_output(forward_inputs, batches);
+  const auto& output = get_model_output(forward_inputs);
   HISTOGRAM_OBSERVE(rec_first_token_latency_microseconds,
                     timer.elapsed_microseconds());
 
@@ -1217,13 +1207,9 @@ ForwardOutput RecEngine::RecMultiRoundEnginePipeline::step(
 }
 
 ForwardOutput RecEngine::RecMultiRoundEnginePipeline::get_model_output(
-    const ForwardInput& model_inputs,
-    const std::vector<Batch>& batches) {
+    const ForwardInput& model_inputs) {
   std::vector<folly::SemiFuture<std::optional<ForwardOutput>>> futures;
   futures.reserve(engine_.workers_.size());
-  record_batch_scheduling(batches,
-                          model_inputs.input_params.meta.is_graph_warmup,
-                          /*use_outer_budget=*/true);
   for (auto& worker : engine_.workers_) {
     futures.emplace_back(worker->step_async(model_inputs));
   }
