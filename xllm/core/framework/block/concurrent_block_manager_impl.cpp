@@ -126,6 +126,11 @@ size_t ConcurrentBlockManagerImpl::num_used_blocks() const {
   return inner_->num_used_blocks();
 }
 
+std::optional<BlockPoolUsage> ConcurrentBlockManagerImpl::pool_usage() const {
+  std::lock_guard<std::recursive_mutex> lock(mutex_);
+  return inner_->pool_usage();
+}
+
 size_t ConcurrentBlockManagerImpl::num_total_blocks() const {
   std::lock_guard<std::recursive_mutex> lock(mutex_);
   return inner_->num_total_blocks();

@@ -96,6 +96,9 @@ class XTensorBlockManagerImpl : public BlockManager {
   // Get KV cache utilization
   double kv_cache_utilization() const override;
 
+  // Counts only blocks in pages handed to this leaf, excluding page prealloc.
+  std::optional<BlockPoolUsage> pool_usage() const override;
+
   // XTensor has no prefix cache. Recycle the page only when refcount is 1.
   void incr_ref_count(std::atomic<uint32_t>* ref_count) override;
   uint32_t dec_ref_count(std::atomic<uint32_t>* ref_count) override;
@@ -163,6 +166,12 @@ class XTensorBlockManagerImpl : public BlockManager {
 
   // Block memory size in bytes
   size_t block_mem_size_;
+
+  friend class XTensorBlockManagerTestPeer;
+
+  // Exact resource count in mapped leaf pages (page alignment can skip IDs).
+  // All reads and updates are guarded by mtx_.
+  int64_t mapped_resources_ = 0;
 
   // Number of available blocks in avail_pages
   std::atomic<size_t> num_avail_blocks_;

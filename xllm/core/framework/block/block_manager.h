@@ -48,6 +48,13 @@ enum class PrefixCachePublishMode : int8_t {
   EXPLICIT,
 };
 
+// A leaf's logical block/slot occupancy, including prefix-cache residents and
+// internal holders, excluding permanent padding and unused reserves.
+struct BlockPoolUsage {
+  int64_t usable_resources = 0;
+  int64_t occupied_resources = 0;
+};
+
 class BlockManager {
  public:
   struct Options {
@@ -167,6 +174,11 @@ class BlockManager {
   virtual size_t num_blocks_in_prefix_cache() const = 0;
   virtual size_t num_free_blocks() const = 0;
   virtual size_t num_used_blocks() const = 0;
+  // No default total-minus-free formula: composites and VMM pools have
+  // different accounting. An unsupported leaf must not look like an idle pool.
+  virtual std::optional<BlockPoolUsage> pool_usage() const {
+    return std::nullopt;
+  }
   // Prefix-cache residents whose only remaining reference is the cache node.
   virtual size_t num_evictable_blocks() const { return 0; }
   // Physically free blocks plus evictable prefix-cache residents.

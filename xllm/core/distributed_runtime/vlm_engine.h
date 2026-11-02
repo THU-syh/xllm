@@ -59,6 +59,7 @@ class VLMEngine : public Engine {
  private:
   template <typename TargetEngine>
   friend class SpeculativeEngineBase;
+  friend class EngineKVCacheMetricsTestPeer;
   bool init_model(MasterStatus master_status);
   KVCacheCapacity estimate_kv_cache_capacity();
   bool allocate_kv_cache(const KVCacheCapacity& kv_cache_cap);

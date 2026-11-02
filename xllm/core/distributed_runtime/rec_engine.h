@@ -59,6 +59,7 @@ class RecEngine : public Engine {
   std::vector<int64_t> get_active_activation_memory() const override;
 
  private:
+  friend class EngineKVCacheMetricsTestPeer;
   // ============================================================
   // RecEnginePipeline: Abstract base class for rec engine execution
   // ============================================================

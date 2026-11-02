@@ -20,9 +20,21 @@ limitations under the License.
 #include <unordered_map>
 #include <vector>
 
+#include "framework/block/block.h"
 #include "platform/platform.h"
 
 namespace xllm {
+
+// One actual worker cache pool. Counts describe logical resources in the
+// tensor layout, not an allocator budget or physical device-memory usage.
+struct KVCachePoolLayout {
+  BlockType block_type = BlockType::KV;
+  int64_t resource_count = 0;
+  int64_t bytes_per_resource = 0;
+  std::string cache_role;
+  int32_t dp_rank = 0;
+  int32_t worker_rank = 0;
+};
 
 // Selected once by the backend, then carried with capacity and shape metadata.
 enum class KPoolCacheLayout : int8_t { PACKED = 0, COMPRESSED_WITH_TAIL = 1 };

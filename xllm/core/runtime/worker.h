@@ -74,6 +74,8 @@ class Worker {
   bool set_speculative_validate_time_predictor(
       const SpeculativeProfileRegistry::ValidateTimePredictor& predictor);
 
+  std::vector<KVCachePoolLayout> kv_cache_pool_layout() const;
+
   void get_cache_info(uint64_t& cluster_id, std::string& addr, uint16_t& port);
 
   bool link_cluster(const std::vector<uint64_t>& cluster_ids,

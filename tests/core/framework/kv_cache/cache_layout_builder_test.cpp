@@ -15,11 +15,13 @@ limitations under the License.
 
 #include "framework/kv_cache/cache_layout_builder.h"
 
+#include <folly/ScopeGuard.h>
 #include <gtest/gtest.h>
 
 #include <string>
 #include <vector>
 
+#include "core/framework/config/parallel_config.h"
 #include "framework/kv_cache/deepseek_v4_cache_geometry.h"
 #include "framework/kv_cache/kv_shard_layout.h"
 #include "layers/common/kv_shard_batch_metadata.h"
@@ -27,6 +29,133 @@ limitations under the License.
 namespace xllm {
 
 namespace {
+
+TEST(CacheLayoutBuilderTest, OccupancyDeduplicatesAliasesAndIncludesScales) {
+  auto& parallel = ParallelConfig::get_instance();
+  const int32_t previous_split = parallel.kv_split_size();
+  auto restore =
+      folly::makeGuard([&] { parallel.kv_split_size(previous_split); });
+  parallel.kv_split_size(4);
+  const int64_t index_pages =
+      Platform::requires_dsa_indexer_cache_replication() ? 4 : 1;
+  torch::Tensor storage = torch::zeros({16, 3}, torch::kUInt8);
+  IndexedKVCacheTensors tensors;
+  tensors.kv_cache_tensors.key_cache =
+      storage.narrow(/*dim=*/0, /*start=*/0, /*length=*/8);
+  tensors.kv_cache_tensors.value_cache = tensors.kv_cache_tensors.key_cache;
+  tensors.key_cache_scale = torch::zeros({8, 1}, torch::kFloat16);
+  tensors.index_cache = torch::zeros({4 * index_pages, 2}, torch::kUInt8);
+  tensors.index_cache_scale =
+      torch::zeros({4 * index_pages, 1}, torch::kFloat16);
+  torch::Tensor second = storage.narrow(/*dim=*/0, /*start=*/8, /*length=*/8);
+  std::vector<KVCache> caches;
+  caches.reserve(3);
+  caches.emplace_back(tensors);
+  caches.emplace_back(KVCacheTensors{second, second});
+  caches.emplace_back(tensors);
+  const auto pools = kv_cache_pool_layout(caches,
+                                          /*replicated_block_pages=*/2,
+                                          /*ssm_checkpoint_stride=*/1);
+  ASSERT_EQ(pools.size(), 1u);
+  EXPECT_EQ(pools[0].resource_count, 4);
+  EXPECT_EQ(pools[0].bytes_per_resource, 6 + 6 + 4 + 4 * index_pages);
+}
+
+TEST(CacheLayoutBuilderTest, OccupancyIncludesLinearCheckpointsAndTail) {
+  std::vector<KVCache> caches;
+  caches.reserve(2);
+  caches.emplace_back(
+      LinearAttentionKVCacheTensors{torch::zeros({3, 4, 2}, torch::kFloat16),
+                                    torch::zeros({6, 2, 2}, torch::kFloat32)});
+  IndexedKVCacheTensors tensors;
+  tensors.kpool_tail = torch::zeros({3, 5}, torch::kUInt8);
+  caches.emplace_back(tensors);
+  const auto pools = kv_cache_pool_layout(caches,
+                                          /*replicated_block_pages=*/1,
+                                          /*ssm_checkpoint_stride=*/2);
+  ASSERT_EQ(pools.size(), 1u);
+  EXPECT_EQ(pools[0].block_type, BlockType::LINEAR);
+  EXPECT_EQ(pools[0].resource_count, 3);
+  EXPECT_EQ(pools[0].bytes_per_resource, 16 + 32 + 5);
+}
+
+TEST(CacheLayoutBuilderTest, OccupancyKeepsSwaAndCompressedPoolsSeparate) {
+  auto& parallel = ParallelConfig::get_instance();
+  const int32_t previous_split = parallel.kv_split_size();
+  auto restore =
+      folly::makeGuard([&] { parallel.kv_split_size(previous_split); });
+  parallel.kv_split_size(4);
+  DeepSeekV4KVCacheTensors tensors;
+  tensors.swa_cache = torch::zeros({3, 2}, torch::kFloat16);
+  tensors.compress_kv_state = torch::zeros({3, 4}, torch::kFloat32);
+#if defined(USE_MLU)
+  tensors.compress_state =
+      tensors.compress_kv_state;  // MLU uses the packed owner.
+#endif
+  tensors.key_cache = torch::zeros({2, 3}, torch::kUInt8);
+  tensors.index_cache = torch::zeros({2, 2}, torch::kUInt8);
+  tensors.indexer_cache_scale = torch::zeros({2, 1}, torch::kFloat16);
+  tensors.compressed_block_type = BlockType::C4;
+  std::vector<KVCache> caches;
+  caches.reserve(1);
+  caches.emplace_back(tensors);
+  const auto pools = kv_cache_pool_layout(caches,
+                                          /*replicated_block_pages=*/1,
+                                          /*ssm_checkpoint_stride=*/1);
+  ASSERT_EQ(pools.size(), 2u);
+  for (const auto& pool : pools) {
+    if (pool.block_type == BlockType::SWA) {
+      EXPECT_EQ(pool.resource_count, 3);
+      EXPECT_EQ(pool.bytes_per_resource, 4 + 16);
+    } else {
+      EXPECT_EQ(pool.block_type, BlockType::C4);
+      EXPECT_EQ(pool.resource_count, 2);
+      EXPECT_EQ(pool.bytes_per_resource, 3 + 2 + 2);
+    }
+  }
+}
+
+TEST(CacheLayoutBuilderTest, OccupancyRejectsInvalidLayouts) {
+  std::vector<KVCache> caches;
+  caches.reserve(2);
+  caches.emplace_back(
+      KVCacheTensors{torch::zeros({4, 2}), torch::zeros({6, 2})});
+  EXPECT_TRUE(kv_cache_pool_layout(caches,
+                                   /*replicated_block_pages=*/1,
+                                   /*ssm_checkpoint_stride=*/1)
+                  .empty());
+  EXPECT_TRUE(kv_cache_pool_layout(caches,
+                                   /*replicated_block_pages=*/3,
+                                   /*ssm_checkpoint_stride=*/1)
+                  .empty());
+  EXPECT_TRUE(kv_cache_pool_layout(caches,
+                                   /*replicated_block_pages=*/0,
+                                   /*ssm_checkpoint_stride=*/1)
+                  .empty());
+  EXPECT_TRUE(kv_cache_pool_layout(caches,
+                                   /*replicated_block_pages=*/1,
+                                   /*ssm_checkpoint_stride=*/0)
+                  .empty());
+  // Discard all contributions to the invalid LINEAR pool, including valid
+  // tensors before and after the error, while retaining the independent KV.
+  caches.clear();
+  caches.reserve(4);
+  caches.emplace_back(
+      KVCacheTensors{torch::zeros({4, 2}), torch::zeros({4, 2})});
+  caches.emplace_back(LinearAttentionKVCacheTensors{torch::zeros({3, 2}),
+                                                    torch::zeros({6, 2})});
+  caches.emplace_back(LinearAttentionKVCacheTensors{torch::zeros({3, 2}),
+                                                    torch::zeros({3, 2})});
+  caches.emplace_back(LinearAttentionKVCacheTensors{torch::zeros({3, 2}),
+                                                    torch::zeros({6, 2})});
+  const auto pools = kv_cache_pool_layout(caches,
+                                          /*replicated_block_pages=*/1,
+                                          /*ssm_checkpoint_stride=*/2);
+  ASSERT_EQ(pools.size(), 1u);
+  EXPECT_EQ(pools[0].block_type, BlockType::KV);
+  EXPECT_EQ(pools[0].resource_count, 4);
+  EXPECT_EQ(pools[0].bytes_per_resource, 16);
+}
 
 TEST(CacheLayoutBuilderTest, DescribesTokenMajorGqaHeads) {
   CacheTensorLayoutContext context;

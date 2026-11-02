@@ -110,6 +110,13 @@ size_t BlockManagerImpl::num_used_blocks() const {
   return total > not_held ? total - not_held : 0;
 }
 
+std::optional<BlockPoolUsage> BlockManagerImpl::pool_usage() const {
+  const int64_t usable = static_cast<int64_t>(num_total_blocks());
+  const int64_t free = static_cast<int64_t>(num_free_blocks());
+  CHECK_LE(free, usable);
+  return BlockPoolUsage{usable, usable - free};
+}
+
 size_t BlockManagerImpl::num_evictable_blocks() const {
   if (prefix_cache_ == nullptr) {
     return 0;

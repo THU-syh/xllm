@@ -67,7 +67,7 @@ class WorkerService : public proto::DistributeWorker {
 
   void AllocateKVCache(::google::protobuf::RpcController* controller,
                        const proto::AllocateKVCacheRequest* request,
-                       proto::Status* response,
+                       proto::AllocateKVCacheResponse* response,
                        ::google::protobuf::Closure* done) override;
 
   void SetSpeculativeValidateTimePredictor(
@@ -79,7 +79,7 @@ class WorkerService : public proto::DistributeWorker {
   void AllocateKVCacheWithTransfer(
       ::google::protobuf::RpcController* controller,
       const proto::AllocateKVCacheRequest* req,
-      proto::Status* resp,
+      proto::AllocateKVCacheResponse* resp,
       ::google::protobuf::Closure* done) override;
 
   void PullKVCache(::google::protobuf::RpcController* controller,

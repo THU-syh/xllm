@@ -118,9 +118,10 @@ void record_prefix_cache_hit_metrics(size_t prompt_tokens, size_t hit_tokens);
 
 // Set a labeled gauge, reporting failures instead of silently dropping a
 // monitoring sample when bvar cannot create or retrieve the series.
-void set_multi_gauge_value(bvar::MultiDimension<bvar::Status<double>>& metric,
-                           std::initializer_list<std::string> labels,
-                           double value);
+void set_multi_gauge_value(
+    bvar::MultiDimension<bvar::Status<double>>& metric,
+    const bvar::MultiDimension<bvar::Status<double>>::key_type& labels,
+    double value);
 
 }  // namespace xllm
 
@@ -341,6 +342,7 @@ DECLARE_MULTI_GAUGE(kv_cache_dp_utilization_perc);
 // Per-leaf effective block/slot usage (non-evictable), not physical occupancy.
 // Each series identifies one DP rank and one allocated block pool.
 DECLARE_MULTI_GAUGE(block_type_dp_utilization_perc);
+DECLARE_MULTI_GAUGE(kv_cache_pool_occupied_bytes);
 DECLARE_GAUGE(kv_cache_max_utilization_perc);
 DECLARE_GAUGE(num_blocks_in_prefix_cache);
 // Legacy least-loaded DP views: maximum free and minimum used block counts.

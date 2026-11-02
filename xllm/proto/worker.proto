@@ -169,6 +169,19 @@ message TransferStatus {
  uint32 success_cnt = 1;
 }
 
+// Initialization metadata only; no live pool state or device synchronization.
+message KVCachePoolLayout {
+  BlockType block_type = 1;
+  int64 resource_count = 2;
+  int64 bytes_per_resource = 3;
+  string cache_role = 4;
+}
+
+message AllocateKVCacheResponse {
+  bool ok = 1;
+  repeated KVCachePoolLayout pool_layout = 2;
+}
+
 message CacheInfo {
   uint64 cluster_id = 1;
   uint32 listen_port = 2;
@@ -456,10 +469,10 @@ service DistributeWorker {
   rpc InitModel (InitModelRequest) returns (Status);
   rpc ProcessGroupTest (Empty) returns (Status);
   rpc ProfileDeviceMemory (Empty) returns (DeviceMemory);
-  rpc AllocateKVCache (AllocateKVCacheRequest) returns (Status);
+  rpc AllocateKVCache (AllocateKVCacheRequest) returns (AllocateKVCacheResponse);
   rpc SetSpeculativeValidateTimePredictor(SpeculativeValidateTimePredictor)
       returns (Status) {}
-  rpc AllocateKVCacheWithTransfer(AllocateKVCacheRequest) returns (Status) {}
+  rpc AllocateKVCacheWithTransfer(AllocateKVCacheRequest) returns (AllocateKVCacheResponse) {}
   rpc PullKVCache(PullKVCacheRequest) returns (Status) {}
   rpc GetCacheInfo(Empty) returns (CacheInfo) {}
   rpc LinkCluster(ClusterInfo) returns (Status) {}

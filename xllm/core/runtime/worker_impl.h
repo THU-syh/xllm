@@ -87,6 +87,10 @@ class WorkerImpl {
   // allocate kv cache. blocking call
   virtual bool allocate_kv_cache(const KVCacheShape& kv_cache_shape);
 
+  virtual std::vector<KVCachePoolLayout> kv_cache_pool_layout() const {
+    return kv_cache_pool_layout_;
+  }
+
   virtual bool allocate_kv_cache_with_transfer(
       const KVCacheShape& kv_cache_shape);
 
@@ -504,6 +508,7 @@ class WorkerImpl {
   mutable CpPlanRuntimeConfig npu_cp_runtime_config_;
 #endif
 
+  std::vector<KVCachePoolLayout> kv_cache_pool_layout_;
   bool is_spec_draft_ = false;
 
   Status status_ = Status::UNINITIALIZED;

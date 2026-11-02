@@ -27,6 +27,13 @@ limitations under the License.
 
 namespace xllm {
 
+// Reads initialized tensors once. Shared layers and K/V aliases count once;
+// disjoint tensors sharing an allocation remain separate. No device sync.
+std::vector<KVCachePoolLayout> kv_cache_pool_layout(
+    const std::vector<KVCache>& kv_caches,
+    int64_t replicated_block_pages,
+    int64_t ssm_checkpoint_stride);
+
 // Records each cache pool's physical token-axis span from the tensors that
 // carry a token axis, so later describe and manifest steps validate a tensor
 // against its own pool geometry instead of the uniform scheduler block size.

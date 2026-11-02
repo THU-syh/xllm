@@ -16,7 +16,9 @@ limitations under the License.
 #pragma once
 
 #include <atomic>
+#include <list>
 #include <map>
+#include <mutex>
 #include <queue>
 #include <unordered_map>
 #include <vector>
@@ -24,6 +26,7 @@ limitations under the License.
 #include "block_manager.h"
 #include "framework/block/embedding_block_manager.h"
 #include "framework/block/kv_cache_manager.h"
+#include "framework/kv_cache/cache_layout_types.h"
 
 namespace xllm {
 
@@ -57,6 +60,7 @@ class BlockManagerPool : public KVCacheManager {
     PROPERTY(int64_t, num_layers) = 0;  // Required when enable_xtensor is true
     PROPERTY(int64_t, slot_size) = 0;   // Memory size per slot (for xtensor)
     PROPERTY(std::string, model_id);    // Model ID for multi-model support
+    PROPERTY(int64_t, server_idx) = 0;
     // Model type of the owning engine (e.g. "deepseek_v41"), forwarded to
     // BlockManager::Options so build_composite_leaves can pick composite
     // behavior by explicit identity rather than inferring it from ratios.
@@ -92,7 +96,7 @@ class BlockManagerPool : public KVCacheManager {
 
   explicit BlockManagerPool(const Options& options, int32_t dp_size = 1);
 
-  ~BlockManagerPool() = default;
+  ~BlockManagerPool() override;
 
   bool allocate(Sequence* sequence) override;
   bool allocate(std::vector<Sequence*>& sequences) override;
@@ -130,6 +134,9 @@ class BlockManagerPool : public KVCacheManager {
   std::vector<std::unordered_map<BlockType, double>>
   block_utilization_by_type_per_dp() const override;
 
+  void set_kv_cache_pool_layout(std::vector<KVCachePoolLayout> layout);
+  void report_pool_occupancy() const override;
+
   int32_t select_dp_rank() const override;
 
   // get the options for the block manager
@@ -151,6 +158,16 @@ class BlockManagerPool : public KVCacheManager {
  private:
   friend class BlockManagerPoolTestPeer;
 
+  std::optional<BlockPoolUsage> pool_usage(const KVCachePoolLayout& pool) const;
+
+  struct PoolMetric {
+    KVCachePoolLayout layout;
+    std::list<std::string> labels;
+  };
+
+  // Protect layout metadata and its gauge updates, not allocator lifetime.
+  mutable std::mutex kv_cache_pool_metrics_mutex_;
+  std::vector<PoolMetric> kv_cache_pool_metrics_;
   mutable std::atomic<size_t> dp_selection_cursor_{0};
   std::vector<std::vector<BlockTransferInfo>> swap_block_transfer_infos_;
 

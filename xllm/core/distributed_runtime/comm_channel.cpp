@@ -33,6 +33,26 @@ limitations under the License.
 namespace xllm {
 namespace {
 
+void read_kv_cache_pool_layout(const proto::AllocateKVCacheResponse& response,
+                               std::vector<KVCachePoolLayout>& pools) {
+  pools.clear();
+  pools.reserve(response.pool_layout_size());
+  for (const auto& entry : response.pool_layout()) {
+    const auto block_type = block_type_from_cache_group_id(
+        static_cast<int32_t>(entry.block_type()));
+    if (!block_type.has_value()) {
+      LOG(WARNING) << "Unknown KV occupancy block_type "
+                   << static_cast<int32_t>(entry.block_type())
+                   << " from worker; skipping this pool";
+      continue;
+    }
+    pools.emplace_back(KVCachePoolLayout{*block_type,
+                                         entry.resource_count(),
+                                         entry.bytes_per_resource(),
+                                         entry.cache_role()});
+  }
+}
+
 uint64_t forward_rpc_envelope_size(uint64_t max_body_size) {
   // ExecuteModel uses baidu_std without authentication, attachments, streams,
   // or user fields. Bound every optional field its controller/BRPC can add,
@@ -125,7 +145,10 @@ bool CommChannel::check_health() {
   return resp.ok();
 }
 
-bool CommChannel::allocate_kv_cache(const KVCacheShape& kv_cache_shape) {
+bool CommChannel::allocate_kv_cache(
+    const KVCacheShape& kv_cache_shape,
+    std::vector<KVCachePoolLayout>& pool_layout) {
+  pool_layout.clear();
   if (!kv_cache_shape.has_key_cache_shape() ||
       kv_cache_shape.key_cache_shape().empty()) {
     LOG(ERROR) << "allocate_kv_cache failed: key cache shape is empty";
@@ -134,15 +157,16 @@ bool CommChannel::allocate_kv_cache(const KVCacheShape& kv_cache_shape) {
   proto::AllocateKVCacheRequest request;
   kv_cache_shape.to_proto(request.mutable_kv_cache_shape());
 
-  proto::Status s;
+  proto::AllocateKVCacheResponse response;
   brpc::Controller cntl;
-  stub_->AllocateKVCache(&cntl, &request, &s, nullptr);
+  stub_->AllocateKVCache(&cntl, &request, &response, nullptr);
 
-  if (cntl.Failed() || !s.ok()) {
+  if (cntl.Failed() || !response.ok()) {
     LOG(ERROR) << "allocate_kv_cache failed: " << cntl.ErrorText();
     return false;
   }
 
+  read_kv_cache_pool_layout(response, pool_layout);
   return true;
 }
 
@@ -357,7 +381,9 @@ bool CommChannel::process_group_test() {
 }
 
 bool CommChannel::allocate_kv_cache_with_transfer(
-    const KVCacheShape& kv_cache_shape) {
+    const KVCacheShape& kv_cache_shape,
+    std::vector<KVCachePoolLayout>& pool_layout) {
+  pool_layout.clear();
   if (!kv_cache_shape.has_key_cache_shape() ||
       kv_cache_shape.key_cache_shape().empty()) {
     LOG(ERROR)
@@ -367,14 +393,15 @@ bool CommChannel::allocate_kv_cache_with_transfer(
   proto::AllocateKVCacheRequest request;
   kv_cache_shape.to_proto(request.mutable_kv_cache_shape());
 
-  proto::Status s;
+  proto::AllocateKVCacheResponse response;
   brpc::Controller cntl;
-  stub_->AllocateKVCacheWithTransfer(&cntl, &request, &s, nullptr);
+  stub_->AllocateKVCacheWithTransfer(&cntl, &request, &response, nullptr);
 
-  if (cntl.Failed() || !s.ok()) {
+  if (cntl.Failed() || !response.ok()) {
     LOG(ERROR) << "AllocateKVCacheWithTransfer failed: " << cntl.ErrorText();
     return false;
   }
+  read_kv_cache_pool_layout(response, pool_layout);
   return true;
 }
 

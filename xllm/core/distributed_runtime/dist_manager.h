@@ -33,6 +33,8 @@ class DistManager {
   };
 
  private:
+  friend class EngineKVCacheMetricsTestPeer;
+  DistManager() = default;
   DISALLOW_COPY_AND_ASSIGN(DistManager);
   void setup_multi_node_workers(const runtime::Options& options,
                                 const std::string& master_node_addr);
