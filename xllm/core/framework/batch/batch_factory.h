@@ -15,7 +15,7 @@ limitations under the License.
 
 #pragma once
 
-#include "common/metrics.h"
+#include "common/macros.h"
 #include "framework/batch/batch.h"
 
 namespace xllm {
@@ -33,14 +33,16 @@ class BatchFactory {
       const std::vector<size_t>& running_sequences_budgets,
       // for beam-search
       std::vector<std::vector<BlockTransferInfo>>* swap_block_transfer_infos =
-          nullptr);
+          nullptr,
+      std::shared_ptr<SchedulingSample> sample = nullptr);
 
   std::vector<Batch> create_rec_batches(
       const std::vector<std::shared_ptr<Request>>& running_requests,
       const std::vector<Sequence*>& running_sequences,
       const std::vector<size_t>& running_sequences_budgets,
       std::vector<std::vector<BlockTransferInfo>>* swap_block_transfer_infos =
-          nullptr);
+          nullptr,
+      std::shared_ptr<SchedulingSample> sample = nullptr);
 
  private:
   BatchFactory(int32_t dp_size, int32_t cp_size)

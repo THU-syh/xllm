@@ -50,7 +50,7 @@ struct ScheduleResult {
 class FixedStepsScheduler final : public ContinuousScheduler {
  public:
   FixedStepsScheduler(Engine* engine, const Options& options);
-  ~FixedStepsScheduler() override = default;
+  ~FixedStepsScheduler() override;
 
   // step the scheduler forward by one step
   // may get blocked if there are no requests to process
@@ -68,8 +68,10 @@ class FixedStepsScheduler final : public ContinuousScheduler {
   class SchedulerPipeline {
    public:
     virtual ~SchedulerPipeline() = default;
-    virtual std::vector<Batch> create_batches(FixedStepsScheduler& scheduler,
-                                              BatchFactory* batch_factory) = 0;
+    virtual std::vector<Batch> create_batches(
+        FixedStepsScheduler& scheduler,
+        BatchFactory* batch_factory,
+        std::shared_ptr<SchedulingSample> sample) = 0;
     virtual bool requires_kv_cache() const = 0;
     // Allocate KV cache for sequence, implemented by each pipeline
     virtual bool allocate_kv_cache(KVCacheManager* kv_cache_manager,
@@ -78,8 +80,10 @@ class FixedStepsScheduler final : public ContinuousScheduler {
 
   class LlmRecSchedulerPipeline final : public SchedulerPipeline {
    public:
-    std::vector<Batch> create_batches(FixedStepsScheduler& scheduler,
-                                      BatchFactory* batch_factory) override;
+    std::vector<Batch> create_batches(
+        FixedStepsScheduler& scheduler,
+        BatchFactory* batch_factory,
+        std::shared_ptr<SchedulingSample> sample) override;
     bool requires_kv_cache() const override { return true; }
     bool allocate_kv_cache(KVCacheManager* kv_cache_manager,
                            Sequence* sequence) override;
@@ -87,8 +91,10 @@ class FixedStepsScheduler final : public ContinuousScheduler {
 
   class OneRecSchedulerPipeline final : public SchedulerPipeline {
    public:
-    std::vector<Batch> create_batches(FixedStepsScheduler& scheduler,
-                                      BatchFactory* batch_factory) override;
+    std::vector<Batch> create_batches(
+        FixedStepsScheduler& scheduler,
+        BatchFactory* batch_factory,
+        std::shared_ptr<SchedulingSample> sample) override;
     bool requires_kv_cache() const override { return false; }
     bool allocate_kv_cache(KVCacheManager* /*kv_cache_manager*/,
                            Sequence* /*sequence*/) override {
@@ -98,8 +104,10 @@ class FixedStepsScheduler final : public ContinuousScheduler {
 
   class OneRecXAttentionSchedulerPipeline final : public SchedulerPipeline {
    public:
-    std::vector<Batch> create_batches(FixedStepsScheduler& scheduler,
-                                      BatchFactory* batch_factory) override;
+    std::vector<Batch> create_batches(
+        FixedStepsScheduler& scheduler,
+        BatchFactory* batch_factory,
+        std::shared_ptr<SchedulingSample> sample) override;
     bool requires_kv_cache() const override { return true; }
     bool allocate_kv_cache(KVCacheManager* kv_cache_manager,
                            Sequence* sequence) override;
@@ -107,8 +115,10 @@ class FixedStepsScheduler final : public ContinuousScheduler {
 
   class RecMultiRoundSchedulerPipeline final : public SchedulerPipeline {
    public:
-    std::vector<Batch> create_batches(FixedStepsScheduler& scheduler,
-                                      BatchFactory* batch_factory) override;
+    std::vector<Batch> create_batches(
+        FixedStepsScheduler& scheduler,
+        BatchFactory* batch_factory,
+        std::shared_ptr<SchedulingSample> sample) override;
     bool requires_kv_cache() const override { return false; }
     bool allocate_kv_cache(KVCacheManager* /*kv_cache_manager*/,
                            Sequence* /*sequence*/) override {

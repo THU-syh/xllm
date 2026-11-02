@@ -71,13 +71,6 @@ limitations under the License.
 namespace xllm {
 namespace {
 
-bool contains_graph_warmup(const std::vector<ForwardInput>& inputs) {
-  return std::any_of(
-      inputs.begin(), inputs.end(), [](const ForwardInput& input) {
-        return input.input_params.meta.is_graph_warmup;
-      });
-}
-
 bool contains_graph_warmup(const std::vector<Batch>& batches) {
   for (const Batch& batch : batches) {
     const std::vector<Sequence*> sequences = batch.get_sequences();
@@ -1216,6 +1209,8 @@ ForwardOutput LLMEngine::step(std::vector<Batch>& batch) {
 
   std::vector<folly::SemiFuture<std::optional<RawForwardOutput>>> futures;
   futures.reserve(worker_clients_num_);
+
+  record_batch_scheduling(batch, is_graph_warmup);
 
   // Engine sends full global tokens; model-side CP shards inside the worker.
   for (auto worker_rank = 0; worker_rank < worker_clients_num_; ++worker_rank) {

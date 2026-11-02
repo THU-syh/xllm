@@ -20,8 +20,8 @@ limitations under the License.
 #include <torch/torch.h>
 
 #include <algorithm>
-#include <array>
 #include <iterator>
+#include <numeric>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -48,6 +48,50 @@ limitations under the License.
 #include "util/utils.h"
 
 namespace xllm {
+
+void record_batch_scheduling(const std::vector<Batch>& batches,
+                             bool is_graph_warmup,
+                             bool use_outer_budget) {
+  if (batches.empty() || is_graph_warmup) {
+    return;
+  }
+  const auto& sample = batches.front().scheduling_sample();
+  if (sample == nullptr || sample->recorded ||
+      std::all_of(batches.begin(), batches.end(), [](const Batch& batch) {
+        return batch.empty();
+      })) {
+    return;
+  }
+  // Count failed validation calls; repeated forwards may retry a sample.
+  auto skip_sample = [&](const char* reason, size_t batch_index) {
+    COUNTER_ADD(scheduling_sample_mismatch_total, 1);
+    LOG_EVERY_N(WARNING, 100)
+        << "Skipping mismatched scheduling sample: " << reason
+        << ", batch_index=" << batch_index
+        << ", workloads=" << sample->workloads.size()
+        << ", batches=" << batches.size();
+  };
+  if (sample->workloads.size() != batches.size()) {
+    skip_sample("workload count mismatch", /*batch_index=*/0);
+    return;
+  }
+  for (size_t rank = 0; rank < batches.size(); ++rank) {
+    if (batches[rank].scheduling_sample() != sample) {
+      skip_sample("batch sample mismatch", rank);
+      return;
+    }
+    const auto& budgets = batches[rank].get_allowed_max_tokens();
+    if (!use_outer_budget && !budgets.empty()) {
+      const SchedulingWorkload& workload = sample->workloads[rank];
+      if (std::accumulate(budgets.begin(), budgets.end(), int64_t{0}) !=
+          workload.prompt_tokens + workload.decode_tokens) {
+        skip_sample("budget/workload mismatch", rank);
+        return;
+      }
+    }
+  }
+  record_scheduling_metrics(*sample);
+}
 
 namespace {
 

@@ -18,6 +18,7 @@ limitations under the License.
 #include <torch/torch.h>
 
 #include <optional>
+#include <vector>
 
 #include "framework/kv_cache_transfer/prefetch_result.h"
 #include "framework/model/model_input_params.h"
@@ -29,6 +30,8 @@ limitations under the License.
 namespace xllm {
 
 class Stream;
+
+bool contains_graph_warmup(const std::vector<ForwardInput>& inputs);
 
 torch::Tensor choose_lm_head_selected_token_idxes(
     const torch::Tensor& selected_token_idxes,

@@ -13,6 +13,7 @@ cc_test(
   DEPS
     :config
     common
+    brpc
     absl::synchronization
     absl::time
     GTest::gtest_main

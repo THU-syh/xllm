@@ -20,10 +20,135 @@ limitations under the License.
 
 #include <algorithm>
 #include <initializer_list>
+#include <list>
 #include <mutex>
 #include <string>
 
 namespace xllm {
+
+namespace {
+
+constexpr std::array<const char*, 4> kSchedulingWorkloads = {"prompt_tokens",
+                                                             "decode_tokens",
+                                                             "prefill_requests",
+                                                             "decode_requests"};
+
+void record_scheduling_value(
+    bvar::MultiDimension<bvar::LatencyRecorder>& histogram,
+    bvar::MultiDimension<bvar::Status<double>>& latest,
+    const std::list<std::string>& labels,
+    int64_t sample,
+    double latest_value,
+    bool update_latest) {
+  CHECK_GE(sample, 0);
+  bvar::LatencyRecorder* recorder = histogram.get_stats(labels);
+  if (recorder == nullptr) {
+    LOG_EVERY_N(WARNING, 100)
+        << "Failed to record scheduling metric for labels "
+        << absl::StrJoin(labels, ", ");
+    return;
+  }
+  *recorder << sample;
+  if (update_latest) {
+    bvar::Status<double>* gauge = latest.get_stats(labels);
+    if (gauge == nullptr) {
+      LOG_EVERY_N(WARNING, 100)
+          << "Failed to update scheduling gauge for labels "
+          << absl::StrJoin(labels, ", ");
+      return;
+    }
+    gauge->set_value(latest_value);
+  }
+}
+
+}  // namespace
+
+void record_scheduling_metrics(SchedulingSample& sample, bool empty) {
+  if (sample.recorded) {
+    return;
+  }
+  if (sample.metrics == nullptr || sample.workloads.empty()) {
+    LOG_EVERY_N(WARNING, 100) << "Skipping incomplete scheduling metric sample";
+    return;
+  }
+  if (empty && std::any_of(sample.workloads.begin(),
+                           sample.workloads.end(),
+                           [](const SchedulingWorkload& workload) {
+                             return workload.prompt_tokens != 0 ||
+                                    workload.decode_tokens != 0 ||
+                                    workload.prefill_requests != 0 ||
+                                    workload.decode_requests != 0;
+                           })) {
+    LOG_EVERY_N(WARNING, 100)
+        << "Skipping empty scheduling metric sample with nonzero workload";
+    return;
+  }
+  const auto now = std::chrono::steady_clock::now();
+  if (now < sample.started_at) {
+    LOG_EVERY_N(WARNING, 100)
+        << "Skipping scheduling metric sample with a future start time";
+    return;
+  }
+  const auto elapsed = now - sample.started_at - sample.excluded_wait;
+  if (elapsed < std::chrono::steady_clock::duration::zero()) {
+    LOG_EVERY_N(WARNING, 100)
+        << "Skipping scheduling metric sample with negative elapsed time";
+    return;
+  }
+  sample.recorded = true;
+  SchedulingMetricState& state = *sample.metrics;
+  const std::lock_guard<std::mutex> lock(state.mutex);
+  if (state.closed) {
+    return;
+  }
+  auto& latest_at = state.latest_at[empty ? 1 : 0];
+  const bool update_latest = now >= latest_at;
+  record_scheduling_value(
+      MULTI_HISTOGRAM_scheduling_latency_microseconds,
+      MULTI_GAUGE_scheduling_latency_microseconds_latest,
+      {state.server, empty ? "empty" : "submitted"},
+      std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count(),
+      std::chrono::duration<double, std::micro>(elapsed).count(),
+      update_latest);
+  for (size_t rank = 0; rank < sample.workloads.size(); ++rank) {
+    const SchedulingWorkload& workload = sample.workloads[rank];
+    const std::array<int64_t, 4> values = {workload.prompt_tokens,
+                                           workload.decode_tokens,
+                                           workload.prefill_requests,
+                                           workload.decode_requests};
+    if (empty) {
+      continue;
+    }
+    const std::string dp = std::to_string(rank);
+    std::list<std::string> labels{state.server, dp, kSchedulingWorkloads[0]};
+    for (size_t index = 0; index < values.size(); ++index) {
+      labels.back() = kSchedulingWorkloads[index];
+      const bool is_tokens = index < 2;
+      auto& histogram = is_tokens
+                            ? MULTI_HISTOGRAM_scheduling_workload_tokens
+                            : MULTI_HISTOGRAM_scheduling_workload_requests;
+      auto& latest = is_tokens
+                         ? MULTI_GAUGE_scheduling_workload_tokens_latest
+                         : MULTI_GAUGE_scheduling_workload_requests_latest;
+      record_scheduling_value(histogram,
+                              latest,
+                              labels,
+                              values[index],
+                              static_cast<double>(values[index]),
+                              update_latest);
+    }
+  }
+  latest_at = std::max(latest_at, now);
+}
+
+void close_scheduling_metrics(SchedulingMetricState& state) {
+  const std::lock_guard<std::mutex> lock(state.mutex);
+  // Recorders are process-scoped and reused by schedulers with the same labels.
+  // Reuse server_idx on reload: new server/DP labels retain additional series.
+  // Keep labels bounded; BRPC's series-count threshold is not a byte limit.
+  // BRPC scrape readers retain raw pointers, so teardown must not delete them.
+  state.closed = true;
+}
 
 void set_multi_gauge_value(bvar::MultiDimension<bvar::Status<double>>& metric,
                            std::initializer_list<std::string> labels,
@@ -255,6 +380,35 @@ DEFINE_GAUGE(num_used_blocks,
              "Minimum effective used admission-cache blocks across DP");
 
 DEFINE_COUNTER(scheduling_latency_seconds, "Latency of scheduling in seconds");
+DEFINE_COUNTER(scheduling_sample_mismatch_total,
+               "Scheduling sample validation failures per submission call");
+bvar::MultiDimension<bvar::LatencyRecorder>
+    MULTI_HISTOGRAM_scheduling_latency_microseconds(
+        "scheduling_latency_microseconds",
+        {"server", "round"});
+// Each observation is a per-DP submitted-round workload, not a latency.
+// Window mean/P99 use tokens/round or Requests/round; count is sampled rounds
+// and qps is rounds/second in both families. Query each workload label
+// separately.
+bvar::MultiDimension<bvar::LatencyRecorder>
+    MULTI_HISTOGRAM_scheduling_workload_tokens("scheduling_workload_tokens",
+                                               {"server", "dp", "workload"});
+bvar::MultiDimension<bvar::LatencyRecorder>
+    MULTI_HISTOGRAM_scheduling_workload_requests("scheduling_workload_requests",
+                                                 {"server", "dp", "workload"});
+bvar::MultiDimension<bvar::Status<double>>
+    MULTI_GAUGE_scheduling_latency_microseconds_latest(
+        "scheduling_latency_microseconds_latest",
+        {"server", "round"});
+// Latest values share the window samples' units.
+bvar::MultiDimension<bvar::Status<double>>
+    MULTI_GAUGE_scheduling_workload_tokens_latest(
+        "scheduling_workload_tokens_latest",
+        {"server", "dp", "workload"});
+bvar::MultiDimension<bvar::Status<double>>
+    MULTI_GAUGE_scheduling_workload_requests_latest(
+        "scheduling_workload_requests_latest",
+        {"server", "dp", "workload"});
 
 DEFINE_COUNTER(num_processing_tokens_total_prompt,
                "Total number of processing prompt tokens");

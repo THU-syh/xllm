@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "scheduler/pd_ooc_scheduler.h"
+#include "core/scheduler/pd_ooc_scheduler.h"
 
 #include <absl/strings/str_join.h>
 #include <absl/time/clock.h>
@@ -27,28 +27,27 @@ limitations under the License.
 #include <string>
 #include <vector>
 
-#include "common/global_flags.h"
-#include "common/interruption_bus.h"
-#include "common/macros.h"
+#include "core/common/global_flags.h"
+#include "core/common/interruption_bus.h"
+#include "core/common/macros.h"
+#include "core/distributed_runtime/engine.h"
 #include "core/distributed_runtime/pd_ooc_service.h"
+#include "core/framework/batch/batch_factory.h"
 #include "core/framework/block/block.h"
 #include "core/framework/config/disagg_pd_config.h"
 #include "core/framework/config/scheduler_config.h"
+#include "core/framework/kv_cache_transfer/kv_cache_transfer.h"
+#include "core/framework/request/request.h"
+#include "core/framework/request/request_state.h"
 #include "core/framework/request/request_timing_proto.h"
+#include "core/framework/request/sequence.h"
+#include "core/runtime/xservice_client.h"
+#include "core/scheduler/continuous_scheduler.h"
+#include "core/util/env_var.h"
+#include "core/util/scope_guard.h"
+#include "core/util/utils.h"
+#include "core/util/uuid.h"
 #include "disagg_pd.pb.h"
-#include "distributed_runtime/engine.h"
-#include "framework/batch/batch_factory.h"
-#include "framework/kv_cache_transfer/kv_cache_transfer.h"
-#include "framework/request/request.h"
-#include "framework/request/request_state.h"
-#include "framework/request/sequence.h"
-#include "pd_ooc_scheduler.h"
-#include "runtime/xservice_client.h"
-#include "scheduler/continuous_scheduler.h"
-#include "util/env_var.h"
-#include "util/scope_guard.h"
-#include "util/utils.h"
-#include "util/uuid.h"
 
 namespace xllm {
 
@@ -379,6 +378,7 @@ void PDOOCScheduler::prefill_step(const absl::Duration& timeout) {
 std::vector<Batch> PDOOCScheduler::prepare_batch() {
   const size_t ingress_request_count = begin_schedule_round();
   Timer timer;
+  auto sample = create_scheduling_sample();
   // propagate new requests to prefill_queue_
   // Include those requests that are preempted by others.
   std::shared_ptr<Request> request;
@@ -592,7 +592,9 @@ std::vector<Batch> PDOOCScheduler::prepare_batch() {
   auto batches = BatchFactory::get_instance(options_.dp_size())
                      ->create_batches(running_requests_,
                                       running_sequences_,
-                                      running_sequences_budgets_);
+                                      running_sequences_budgets_,
+                                      nullptr,
+                                      std::move(sample));
 
   bool is_batches_empty =
       (std::all_of(batches.begin(), batches.end(), [](const Batch& one_batch) {

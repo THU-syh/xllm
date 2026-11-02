@@ -28,6 +28,7 @@ limitations under the License.
 #include <list>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -52,6 +53,7 @@ namespace xllm {
 class Engine;
 class RequestPriorityQueue;
 class SchedulerPolicy;
+struct SchedulingMetricState;
 struct SchedulerState;
 
 struct DecodeRestoreEntry {
@@ -297,6 +299,11 @@ class ContinuousScheduler : public Scheduler {
   void abort_all_running_requests();
 
  protected:
+  // Created on the scheduler thread; execution may take ownership via a task.
+  std::shared_ptr<SchedulingSample> create_scheduling_sample();
+  // Called only when schedule_request returns batches known to be empty.
+  void record_empty_scheduling_round(const std::vector<Batch>& batches);
+
   void report_request_queue_metrics();
   virtual void append_request_queue_metrics(
       std::vector<std::pair<std::string, size_t>>&) {}
@@ -313,6 +320,7 @@ class ContinuousScheduler : public Scheduler {
   static int64_t amortized_token_latency(int64_t latency, size_t num_tokens);
 
   const Options options_;
+  std::shared_ptr<SchedulingMetricState> scheduling_metrics_;
 
   const std::string server_label_;
   std::vector<std::pair<std::string, size_t>> request_queue_samples_;

@@ -404,7 +404,8 @@ std::shared_ptr<Request> generate_request_with_prompt_tokens(
     const std::vector<int32_t>& prompt_token_ids,
     int32_t max_tokens,
     int32_t max_context_len,
-    const std::string& service_request_id = "1") {
+    const std::string& service_request_id = "1",
+    bool enable_schedule_overlap = false) {
   RequestSamplingParam sampling_param;
   SchedulerParam scheduler_param;
 
@@ -425,7 +426,7 @@ std::shared_ptr<Request> generate_request_with_prompt_tokens(
                          false,
                          false,
                          false,
-                         false,
+                         enable_schedule_overlap,
                          nullptr,
                          nullptr);
 
@@ -855,6 +856,50 @@ class BlockedOverlapScheduler final : public ContinuousScheduler {
 
  private:
   size_t prepare_calls_ = 0;
+};
+
+// Exercise the real scheduler and input builder; model execution is a single
+// deterministic token. Sampling matches LLMEngine's first dispatch.
+class ObservedStepEngine final : public FakeEngine {
+ public:
+  explicit ObservedStepEngine(bool overlap)
+      : FakeEngine(/*num_blocks=*/32, /*block_size=*/4), overlap_(overlap) {}
+
+  ForwardOutput step(std::vector<Batch>& batches) override {
+    for (Batch& batch : batches) {
+      if (!batch.empty()) {
+        (void)batch.prepare_forward_input(
+            /*num_decoding_tokens=*/1,
+            /*min_decoding_batch_size=*/0,
+            model_args());
+      }
+    }
+    record_batch_scheduling(batches);
+    write_output(batches, /*replace_fake_token=*/false);
+    return {};
+  }
+
+  void update_last_step_result(std::vector<Batch>& batches) override {
+    write_output(batches, /*replace_fake_token=*/true);
+  }
+
+ private:
+  void write_output(std::vector<Batch>& batches, bool replace_fake_token) {
+    for (Batch& batch : batches) {
+      if (batch.empty()) {
+        continue;
+      }
+      RawForwardOutput output;
+      output.outputs.resize(batch.size());
+      for (RawSampleOutput& sample : output.outputs) {
+        sample.tokens.resize(1);
+        sample.tokens.front().id = overlap_ && !replace_fake_token ? -1 : 5;
+      }
+      batch.process_sample_output(output, replace_fake_token);
+    }
+  }
+
+  const bool overlap_;
 };
 
 }  // namespace
@@ -3028,6 +3073,81 @@ TEST(ContinuousSchedulerTest,
   // engine to skip the block manager's "all blocks freed" teardown check.
   scheduler.reset();
   (void)engine.release();
+}
+
+TEST(ContinuousSchedulerMetricsTest, RecordsOneEmptySampleAfterRetries) {
+  class RetryingEmptyScheduler final : public ContinuousScheduler {
+   public:
+    using ContinuousScheduler::ContinuousScheduler;
+    int32_t prepare_calls() const { return prepare_calls_; }
+
+   protected:
+    std::vector<Batch> prepare_batch() override {
+      ++prepare_calls_;
+      return ContinuousScheduler::prepare_batch();
+    }
+    bool if_queue_not_empty() override { return prepare_calls_ < 3; }
+
+   private:
+    int32_t prepare_calls_ = 0;
+  };
+  FakeEngine engine(/*num_blocks=*/32, /*block_size=*/4);
+  auto options = create_scheduler_options(
+      /*max_tokens_per_batch=*/16,
+      /*max_seqs_per_batch=*/4,
+      /*num_speculative_tokens=*/0,
+      /*max_tokens_per_chunk_for_prefill=*/4,
+      /*dp_size=*/1);
+  options.enable_schedule_overlap(false).server_idx(744);
+  RetryingEmptyScheduler scheduler(&engine, options);
+  scheduler.step(absl::ZeroDuration());
+  EXPECT_EQ(scheduler.prepare_calls(), 3);
+  EXPECT_EQ(MULTI_HISTOGRAM_scheduling_latency_microseconds
+                .get_stats({"744", "empty"})
+                ->count(),
+            1);
+}
+
+TEST(ContinuousSchedulerMetricsTest, RecordsSubmittedEmptyAndOverlapRounds) {
+  for (const bool enabled : {false, true}) {
+    SCOPED_TRACE(enabled);
+    ScopedConfigValue<bool> overlap(
+        SchedulerConfig::get_instance().enable_schedule_overlap(), enabled);
+    ObservedStepEngine engine(enabled);
+    auto options = create_scheduler_options(
+        /*max_tokens_per_batch=*/16,
+        /*max_seqs_per_batch=*/4,
+        /*num_speculative_tokens=*/0,
+        /*max_tokens_per_chunk_for_prefill=*/4,
+        /*dp_size=*/1);
+    const std::string server = enabled ? "78" : "77";
+    options.enable_schedule_overlap(enabled).server_idx(enabled ? 78 : 77);
+    {
+      TestContinuousScheduler scheduler(&engine, options);
+      auto request = generate_request_with_prompt_tokens(
+          {1, 2, 3, 4},
+          /*max_tokens=*/1,
+          /*max_context_len=*/32,
+          /*service_request_id=*/"",
+          /*enable_schedule_overlap=*/enabled);
+      request->state().output_func = [](const RequestOutput&) { return true; };
+      ASSERT_TRUE(scheduler.add_request(request));
+      scheduler.step(absl::ZeroDuration());
+      scheduler.step(absl::ZeroDuration());
+      if (enabled) {
+        scheduler.step(absl::ZeroDuration());
+      }
+      auto& latency = MULTI_HISTOGRAM_scheduling_latency_microseconds;
+      EXPECT_EQ(latency.get_stats({server, "submitted"})->count(),
+                enabled ? 2 : 1);
+      EXPECT_EQ(latency.get_stats({server, "empty"})->count(), 1);
+      scheduler.wait_for_responses();
+    }
+    EXPECT_EQ(MULTI_HISTOGRAM_scheduling_latency_microseconds
+                  .get_stats({server, "submitted"})
+                  ->count(),
+              enabled ? 2 : 1);
+  }
 }
 
 }  // namespace xllm
