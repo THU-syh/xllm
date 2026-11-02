@@ -42,6 +42,7 @@ def pool_key_indexer(
     layout_k: str = "BSND",
     mask_mode: int = 3,
     quant_mode: int = -1,
+    sparse_indices_mode: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run CANN's fused pool-key indexer for supported layouts."""
     if layout_q == "BSND":
@@ -186,6 +187,7 @@ def pool_key_indexer(
         mask_mode=mask_mode,
         quant_mode=quant_mode,
         return_value=return_value,
+        sparse_indices_mode=sparse_indices_mode,
     )
 
 

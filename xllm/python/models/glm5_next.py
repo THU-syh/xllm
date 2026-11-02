@@ -1213,6 +1213,7 @@ class Glm5NextIndexer(nn.Module):
             block_table=fused_block_table.clamp(min=0).to(dtype=torch.int32).contiguous(),
             mask_mode=3,
             layout_k="PA_BBND",
+            sparse_indices_mode=1,
         )
 
         output_width = self.topk_output_width
