@@ -173,10 +173,6 @@ folly::SemiFuture<bool> Worker::init_model_async(
       model_weights_path, random_seed, master_status);
 }
 
-std::vector<KVCachePoolLayout> Worker::kv_cache_pool_layout() const {
-  return impl_->kv_cache_pool_layout();
-}
-
 folly::SemiFuture<bool> Worker::allocate_kv_cache_async(
     const KVCacheShape& kv_cache_shape) {
   return impl_->allocate_kv_cache_async(kv_cache_shape);

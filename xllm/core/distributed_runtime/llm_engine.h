@@ -157,7 +157,6 @@ class LLMEngine : public Engine {
 
   template <typename TargetEngine>
   friend class SpeculativeEngineBase;
-  friend class EngineKVCacheMetricsTestPeer;
   // setup workers internal
   void setup_workers(const runtime::Options& options);
   bool init_model(MasterStatus master_status = MasterStatus::WAKEUP);

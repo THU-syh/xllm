@@ -79,7 +79,6 @@ class BlockManagerImpl : public BlockManager {
   // Sequence-held blocks: the usable pool fixed at init, minus free blocks,
   // minus prefix-cache residents that can be evicted.
   size_t num_used_blocks() const override;
-  std::optional<BlockPoolUsage> pool_usage() const override;
 
   size_t num_evictable_blocks() const override;
 

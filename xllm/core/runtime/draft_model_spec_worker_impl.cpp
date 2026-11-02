@@ -169,9 +169,8 @@ KVCacheShape build_speculative_draft_kv_cache_shape(
   // A replicated draft pool owns `replicated_block_pages` physical rows per
   // logical block on every rank, so the block manager's logical block ids still
   // index it directly and the draft's slots stay logical token slots.
-  draft_capacity
-      .n_blocks(target_kv_cache_shape.key_cache_shape()[0] *
-                replicated_block_pages)
+  draft_capacity.n_blocks(target_kv_cache_shape.key_cache_shape()[0] *
+                          replicated_block_pages)
       .block_size(block_size)
       .replicated_block_pages(replicated_block_pages)
       .enable_mla_kv_cache_quant(draft_mla_packed_c8);
@@ -361,18 +360,6 @@ bool DraftModelSpecWorkerImpl::allocate_pools(
     finalize_hierarchy_kv_cache_transfers();
   }
   return allocated;
-}
-
-std::vector<KVCachePoolLayout> DraftModelSpecWorkerImpl::kv_cache_pool_layout()
-    const {
-  auto pools = impl_->kv_cache_pool_layout();
-  auto draft_pools = draft_impl_->kv_cache_pool_layout();
-  pools.reserve(pools.size() + draft_pools.size());
-  for (auto& pool : draft_pools) {
-    pool.cache_role = "draft";
-    pools.emplace_back(std::move(pool));
-  }
-  return pools;
 }
 
 bool DraftModelSpecWorkerImpl::allocate_kv_cache(

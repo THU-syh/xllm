@@ -63,12 +63,6 @@ class RemoteWorker : public WorkerClient {
       const SpeculativeProfileRegistry::ValidateTimePredictor& predictor)
       override;
 
-  // Read after successful cache allocation; await its future for async calls.
-  // Must not run concurrently with cache allocation.
-  std::vector<KVCachePoolLayout> kv_cache_pool_layout() const override {
-    return kv_cache_pool_layout_;
-  }
-
   void get_cache_info(uint64_t& cluster_id,
                       std::string& addr,
                       uint16_t& port) override;
@@ -164,7 +158,6 @@ class RemoteWorker : public WorkerClient {
   DISALLOW_COPY_AND_ASSIGN(RemoteWorker);
 
  private:
-  std::vector<KVCachePoolLayout> kv_cache_pool_layout_;
   int32_t global_rank_;
   // connection resource
   std::unique_ptr<CommChannel> channel_;

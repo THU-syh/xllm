@@ -45,8 +45,7 @@ class CommChannel {
 
   virtual bool hello();
 
-  virtual bool allocate_kv_cache(const KVCacheShape& kv_cache_shape,
-                                 std::vector<KVCachePoolLayout>& pool_layout);
+  virtual bool allocate_kv_cache(const KVCacheShape& kv_cache_shape);
 
   virtual bool set_speculative_validate_time_predictor(
       const SpeculativeProfileRegistry::ValidateTimePredictor& predictor);
@@ -90,8 +89,7 @@ class CommChannel {
   virtual bool process_group_test();
 
   virtual bool allocate_kv_cache_with_transfer(
-      const KVCacheShape& kv_cache_shape,
-      std::vector<KVCachePoolLayout>& pool_layout);
+      const KVCacheShape& kv_cache_shape);
 
   virtual void transfer_kv_blocks(
       const std::vector<BlockTransferInfo>& block_transfer_info,

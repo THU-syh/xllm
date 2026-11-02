@@ -72,7 +72,6 @@ class ConcurrentBlockManagerImpl : public BlockManager {
   size_t num_blocks_in_prefix_cache() const override;
   size_t num_free_blocks() const override;
   size_t num_used_blocks() const override;
-  std::optional<BlockPoolUsage> pool_usage() const override;
   size_t num_total_blocks() const override;
   double kv_cache_utilization() const override;
 

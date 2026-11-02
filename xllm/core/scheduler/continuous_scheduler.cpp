@@ -108,7 +108,6 @@ BatchMode resolve_batch_mode(const ContinuousScheduler::Options& options) {
 }
 
 void report_kv_cache_metrics(const KVCacheManager& kv_cache_manager) {
-  kv_cache_manager.report_pool_occupancy();
   const std::vector<double> dp_utilization =
       kv_cache_manager.kv_cache_utilization_per_dp();
   CHECK(!dp_utilization.empty()) << "KV cache manager must expose a DP pool";
@@ -116,7 +115,7 @@ void report_kv_cache_metrics(const KVCacheManager& kv_cache_manager) {
       kv_cache_manager.block_utilization_by_type_per_dp();
   CHECK_EQ(dp_utilization.size(), type_utilization.size());
   // Process-global gauges assume one reporting manager with fixed DP/leaf
-  // topology. Layout replacement resets its series; this report refreshes them.
+  // topology per process. Replacing it requires separate series cleanup.
   for (size_t dp_rank = 0; dp_rank < dp_utilization.size(); ++dp_rank) {
     const std::string rank_label = std::to_string(dp_rank);
     MULTI_GAUGE_SET(kv_cache_dp_utilization_perc,

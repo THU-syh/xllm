@@ -75,7 +75,7 @@ bool RemoteWorker::wait_for_server_ready(const std::string& server_address) {
 }
 
 bool RemoteWorker::allocate_kv_cache(const KVCacheShape& kv_cache_shape) {
-  return channel_->allocate_kv_cache(kv_cache_shape, kv_cache_pool_layout_);
+  return channel_->allocate_kv_cache(kv_cache_shape);
 }
 
 bool RemoteWorker::set_speculative_validate_time_predictor(
@@ -212,16 +212,15 @@ folly::SemiFuture<bool> RemoteWorker::allocate_kv_cache_async(
     const KVCacheShape& kv_cache_shape) {
   folly::Promise<bool> promise;
   auto future = promise.getSemiFuture();
-  threadpool_.schedule([this,
-                        kv_cache_shape,
-                        promise = std::move(promise)]() mutable {
-    if (!channel_->allocate_kv_cache(kv_cache_shape, kv_cache_pool_layout_)) {
-      LOG(ERROR) << "allocate_kv_cache_async failed";
-      promise.setValue(false);
-    } else {
-      promise.setValue(true);
-    }
-  });
+  threadpool_.schedule(
+      [this, kv_cache_shape, promise = std::move(promise)]() mutable {
+        if (!channel_->allocate_kv_cache(kv_cache_shape)) {
+          LOG(ERROR) << "allocate_kv_cache_async failed";
+          promise.setValue(false);
+        } else {
+          promise.setValue(true);
+        }
+      });
   return future;
 }
 
@@ -231,8 +230,7 @@ folly::SemiFuture<bool> RemoteWorker::allocate_kv_cache_with_transfer_async(
   auto future = promise.getSemiFuture();
   threadpool_.schedule(
       [this, kv_cache_shape, promise = std::move(promise)]() mutable {
-        if (!channel_->allocate_kv_cache_with_transfer(kv_cache_shape,
-                                                       kv_cache_pool_layout_)) {
+        if (!channel_->allocate_kv_cache_with_transfer(kv_cache_shape)) {
           LOG(ERROR) << "AllocateKVCacheWithTransfer failed";
           promise.setValue(false);
         } else {

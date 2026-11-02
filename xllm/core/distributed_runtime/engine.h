@@ -201,32 +201,6 @@ class Engine {
   };
 
  protected:
-  template <typename Workers>
-  void register_kv_cache_pool_layout(const Workers& workers, int32_t dp_size) {
-    CHECK_GT(dp_size, 0);
-    CHECK_EQ(workers.size() % dp_size, 0);
-    const size_t workers_per_dp = workers.size() / dp_size;
-    std::vector<KVCachePoolLayout> layout;
-    layout.reserve(workers.size());
-    auto* manager = block_manager_pool();
-    for (size_t rank = 0; rank < workers.size(); ++rank) {
-      auto worker_layout = workers[rank]->kv_cache_pool_layout();
-      if (worker_layout.empty()) {
-        LOG(WARNING) << "KV occupancy layout unavailable: model="
-                     << manager->options().model_id()
-                     << ", worker_rank=" << rank
-                     << ", dp_rank=" << rank / workers_per_dp;
-        continue;
-      }
-      for (auto& pool : worker_layout) {
-        pool.worker_rank = static_cast<int32_t>(rank);
-        pool.dp_rank = static_cast<int32_t>(rank / workers_per_dp);
-        layout.emplace_back(std::move(pool));
-      }
-    }
-    manager->set_kv_cache_pool_layout(std::move(layout));
-  }
-
   void configure_prefix_cache(runtime::Options& options) const {
     const bool enable_xtensor = KVCacheConfig::get_instance().enable_xtensor();
     if (options.enable_prefix_cache() && enable_xtensor) {

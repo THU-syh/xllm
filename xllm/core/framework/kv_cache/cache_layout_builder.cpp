@@ -20,7 +20,6 @@ limitations under the License.
 #include <algorithm>
 #include <limits>
 #include <string>
-#include <unordered_set>
 #include <utility>
 
 #include "util/utils.h"
@@ -431,108 +430,6 @@ bool is_kv_head_role(KVCacheTensorRole role) {
 }
 
 }  // namespace
-
-std::vector<KVCachePoolLayout> kv_cache_pool_layout(
-    const std::vector<KVCache>& kv_caches,
-    int64_t replicated_block_pages,
-    int64_t ssm_checkpoint_stride) {
-  if (replicated_block_pages < 1 || ssm_checkpoint_stride < 1) {
-    LOG_EVERY_N(WARNING, 100)
-        << "KV occupancy layout unavailable: invalid resource row counts"
-        << ", replicated_block_pages=" << replicated_block_pages
-        << ", ssm_checkpoint_stride=" << ssm_checkpoint_stride;
-    return {};
-  }
-  struct PoolLayoutState {
-    KVCachePoolLayout layout;
-    std::unordered_set<const void*> seen;
-    bool valid = true;
-  };
-  std::unordered_map<int32_t, PoolLayoutState> pools;
-  for (const KVCache& cache : kv_caches) {
-    for (const KVCacheTensor& entry : cache.get_cache_tensors()) {
-      auto& state = pools[entry.group_id];
-      if (!state.valid) {
-        continue;
-      }
-      const torch::Tensor& tensor = entry.tensor;
-      auto skip_pool = [&](const char* reason) {
-        state.valid = false;
-        LOG_EVERY_N(WARNING, 100)
-            << "Skipping KV occupancy pool: role=" << entry.role.to_string()
-            << ", shape=" << tensor.sizes() << ", group=" << entry.group_id
-            << ", reason=" << reason;
-      };
-      // An unsupported tensor invalidates its whole pool, including any
-      // earlier contributions. Other pools remain independent.
-      if (!tensor.is_contiguous() || tensor.dim() == 0 || tensor.size(0) <= 0) {
-        skip_pool("unsupported tensor view");
-        continue;
-      }
-      if (!state.seen.insert(tensor.data_ptr()).second) {
-        continue;
-      }
-      // Quantization scales address the same physical rows as their K/V.
-      KVCacheTensorRole row_role = entry.role;
-      if (row_role == KVCacheTensorRole::KEY_SCALE) {
-        row_role = KVCacheTensorRole::KEY;
-      } else if (row_role == KVCacheTensorRole::VALUE_SCALE) {
-        row_role = KVCacheTensorRole::VALUE;
-      }
-      // Grouped V4/V4.1 index tensors have one row per pool block.
-      // Only flat DSA index tensors replicate rows across kv splits.
-      const bool grouped_index =
-          entry.group_id != cache_group_id(BlockType::KV) &&
-          (row_role == KVCacheTensorRole::INDEX ||
-           row_role == KVCacheTensorRole::INDEX_SCALE);
-      const int64_t rows =
-          grouped_index
-              ? 1
-              : physical_rows_per_resource(
-                    row_role, replicated_block_pages, ssm_checkpoint_stride);
-      if (rows <= 0 || tensor.size(0) % rows != 0) {
-        skip_pool("invalid or incomplete resource rows");
-        continue;
-      }
-      const int64_t resources = tensor.size(0) / rows;
-      auto& pool = state.layout;
-      if (pool.resource_count != 0 && pool.resource_count != resources) {
-        skip_pool("inconsistent resource counts");
-        continue;
-      }
-      int64_t tensor_bytes = static_cast<int64_t>(tensor.nbytes());
-#if defined(USE_NPU)
-      // NZ storage can pad the inner dimensions beyond the visible shape.
-      // Current producers expose whole formatted tensors, not folded views.
-      if (tensor.device().is_privateuseone() &&
-          at_npu::native::get_npu_format(tensor) != ACL_FORMAT_ND) {
-        if (tensor.storage_offset() != 0) {
-          skip_pool("formatted cache view");
-          continue;
-        }
-        tensor_bytes = static_cast<int64_t>(tensor.storage().nbytes());
-      }
-#endif
-      if (resources <= 0 || tensor_bytes <= 0 ||
-          tensor_bytes % resources != 0) {
-        skip_pool("invalid or indivisible resource bytes");
-        continue;
-      }
-      pool.block_type = static_cast<BlockType>(entry.group_id);
-      pool.resource_count = resources;
-      pool.bytes_per_resource += tensor_bytes / resources;
-    }
-  }
-  std::vector<KVCachePoolLayout> result;
-  result.reserve(pools.size());
-  for (auto& [group, state] : pools) {
-    if (!state.valid) {
-      continue;
-    }
-    result.emplace_back(std::move(state.layout));
-  }
-  return result;
-}
 
 int64_t physical_rows_per_resource(KVCacheTensorRole role,
                                    int64_t replicated_block_pages,

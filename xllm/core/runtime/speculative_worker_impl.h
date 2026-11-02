@@ -98,10 +98,6 @@ class SpeculativeWorkerImpl : public WorkerImpl {
     return impl_->estimate_kv_cache_capacity();
   };
 
-  std::vector<KVCachePoolLayout> kv_cache_pool_layout() const override {
-    return impl_->kv_cache_pool_layout();
-  }
-
   // allocate kv cache. blocking call
   bool allocate_kv_cache(const KVCacheShape& kv_cache_shape) override;
 

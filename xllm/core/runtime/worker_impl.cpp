@@ -25,7 +25,6 @@ limitations under the License.
 #include <algorithm>
 
 #include "core/runtime/json_object_output_rows.h"
-#include "framework/kv_cache/cache_layout_builder.h"
 #if defined(USE_NPU)
 #include "acl/acl.h"
 #include "kernels/npu/xllm_ops/xllm_ops_api.h"
@@ -588,14 +587,6 @@ bool WorkerImpl::allocate_kv_cache_storage(
   // KV cache over a VMM-backed SleepableAllocator region (see kv_cache.cpp), so
   // sleep()/wake_up() can release / re-acquire it.
   allocate_kv_caches(kv_caches_, kv_cache_shape, create_options);
-  kv_cache_pool_layout_ =
-      xllm::kv_cache_pool_layout(kv_caches_,
-                                 kv_cache_shape.replicated_block_pages(),
-                                 kv_cache_shape.linear_ssm_checkpoint_stride());
-  for (auto& pool : kv_cache_pool_layout_) {
-    pool.cache_role =
-        is_spec_draft_ || options_.is_draft_engine() ? "draft" : "target";
-  }
   init_hierarchy_kv_cache_transfer(kv_cache_shape, create_options);
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_DCU)

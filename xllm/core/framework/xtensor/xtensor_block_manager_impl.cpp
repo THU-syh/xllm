@@ -118,7 +118,6 @@ std::vector<int32_t> XTensorBlockManagerImpl::alloc_internal(size_t need_size) {
         return ret_index;
       }
       new_page->init(block_mem_size_);
-      mapped_resources_ += static_cast<int64_t>(new_page->num_free_blocks());
       num_avail_blocks_ += new_page->num_free_blocks();
       int64_t page_id = new_page->page_id();
       avail_pages_[page_id] = std::move(new_page);
@@ -233,7 +232,6 @@ void XTensorBlockManagerImpl::free_blocks(const std::vector<int32_t>& indices) {
 
     if (page->empty()) {
       pages_to_free.push_back(page_id);
-      mapped_resources_ -= static_cast<int64_t>(page->num_free_blocks());
       num_avail_blocks_ -= page->num_free_blocks();
       if (was_in_full) {
         full_pages_.erase(page_id);
@@ -314,22 +312,6 @@ double XTensorBlockManagerImpl::kv_cache_utilization() const {
   size_t total = num_total_blocks();
   if (total == 0) return 0.0;
   return static_cast<double>(get_num_allocated_blocks()) / total;
-}
-
-std::optional<BlockPoolUsage> XTensorBlockManagerImpl::pool_usage() const {
-  std::lock_guard<std::mutex> lock(mtx_);
-  const int64_t padding = padding_block_.has_value() ? 1 : 0;
-  const int64_t free = static_cast<int64_t>(num_avail_blocks_.load());
-  const int64_t reserved = static_cast<int64_t>(reserved_blocks_.size());
-  const int64_t usable = mapped_resources_ - padding;
-  if (usable < free + reserved) {
-    LOG_EVERY_N(ERROR, 100)
-        << "KV occupancy unavailable: mapped_resources=" << mapped_resources_
-        << ", padding=" << padding << ", free=" << free
-        << ", reserved=" << reserved;
-    return std::nullopt;
-  }
-  return BlockPoolUsage{usable, usable - free - reserved};
 }
 
 size_t XTensorBlockManagerImpl::num_total_blocks() const {

@@ -150,10 +150,9 @@ void close_scheduling_metrics(SchedulingMetricState& state) {
   state.closed = true;
 }
 
-void set_multi_gauge_value(
-    bvar::MultiDimension<bvar::Status<double>>& metric,
-    const bvar::MultiDimension<bvar::Status<double>>::key_type& labels,
-    double value) {
+void set_multi_gauge_value(bvar::MultiDimension<bvar::Status<double>>& metric,
+                           std::initializer_list<std::string> labels,
+                           double value) {
   bvar::Status<double>* gauge = metric.get_stats(labels);
   if (gauge == nullptr) {
     LOG_EVERY_N(WARNING, 100) << "Failed to update multi gauge for labels "
@@ -203,18 +202,6 @@ DEFINE_HISTOGRAM(mm_preprocess_latency_milliseconds,
 
 DEFINE_HISTOGRAM(encoder_cache_hit_rate,
                  "Histogram of encoder cache hit rate in percent");
-
-// Occupied leaf resources converted with each worker's actual cache layout.
-// Includes evictable prefix-cache residents; excludes permanent padding, unused
-// reserves and Host copies. Admission utilization excludes evictable residents.
-bvar::MultiDimension<bvar::Status<double>>
-    MULTI_GAUGE_kv_cache_pool_occupied_bytes("kv_cache_pool_occupied_bytes",
-                                             {"model_id",
-                                              "server_idx",
-                                              "cache_role",
-                                              "dp_rank",
-                                              "worker_rank",
-                                              "block_type"});
 
 // block manager metrics
 DEFINE_COUNTER(prefix_cache_latency_seconds_insert,

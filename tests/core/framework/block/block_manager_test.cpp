@@ -25,7 +25,6 @@ limitations under the License.
 #include "block_manager_impl.h"
 #include "block_manager_pool.h"
 #include "common/global_flags.h"
-#include "common/metrics.h"
 #include "concurrent_block_manager_impl.h"
 #include "core/framework/batch/batch.h"
 #include "core/framework/config/scheduler_config.h"
@@ -35,35 +34,8 @@ limitations under the License.
 #include "framework/model/model_input_params.h"
 #include "framework/prefix_cache/block_hasher.h"
 #include "framework/request/incremental_decoder.h"
-#include "framework/xtensor/xtensor_block_manager_impl.h"
 
 namespace xllm {
-
-class XTensorBlockManagerTestPeer final {
- public:
-  static void set_available(XTensorBlockManagerImpl& manager, size_t count) {
-    manager.num_avail_blocks_ = count;
-  }
-
-  static void seed_pages(XTensorBlockManagerImpl& manager) {
-    // 16B pages / 7B blocks: page 1 holds one block, not floor(16/7).
-    for (int64_t page_id : {0, 1, 3}) {
-      auto page = std::make_unique<VirtPage>(page_id, /*page_size=*/16);
-      page->init(/*block_mem_size=*/7);
-      manager.mapped_resources_ +=
-          static_cast<int64_t>(page->num_free_blocks());
-      page->alloc(page_id == 3 ? 1 : page->num_free_blocks());
-      manager.num_avail_blocks_ += page->num_free_blocks();
-      if (page->full()) {
-        manager.full_pages_[page_id] = std::move(page);
-      } else {
-        manager.avail_pages_[page_id] = std::move(page);
-      }
-    }
-    manager.padding_block_ = 0;
-    manager.reserved_blocks_ = {1};
-  }
-};
 
 namespace {
 
@@ -223,10 +195,6 @@ TEST(BlockManagerTest, Basic) {
 
   EXPECT_EQ(manager.num_free_blocks(), n_blocks - 1);
   EXPECT_EQ(manager.block_size(), block_size);
-  const auto initial_usage = manager.pool_usage();
-  ASSERT_TRUE(initial_usage.has_value());
-  EXPECT_EQ(initial_usage->usable_resources, n_blocks - 1);
-  EXPECT_EQ(initial_usage->occupied_resources, 0);
 
   // Allocate a block
   {
@@ -239,11 +207,9 @@ TEST(BlockManagerTest, Basic) {
     EXPECT_EQ(block.ref_count(), 1);
 
     EXPECT_EQ(manager.num_free_blocks(), n_blocks - 2);
-    EXPECT_EQ(manager.pool_usage()->occupied_resources, 1);
   }
   // the block should be freed after the scope
   EXPECT_EQ(manager.num_free_blocks(), n_blocks - 1);
-  EXPECT_EQ(manager.pool_usage()->occupied_resources, 0);
 
   // Allocate a list of blocks
   {
@@ -719,142 +685,10 @@ TEST_F(BlockManagerPoolTest, ReportsEachBlockTypeAndDpIndependently) {
   EXPECT_DOUBLE_EQ(utilization[1].at(BlockType::LINEAR), 0.0);
   EXPECT_DOUBLE_EQ(utilization[1].at(BlockType::EMBEDDING), 0.0);
 
-  pool.set_kv_cache_pool_layout({{BlockType::KV, 5, 64, "target"}});
-  for (size_t dp_rank = 0; dp_rank < utilization.size(); ++dp_rank) {
-    const std::string rank_label = std::to_string(dp_rank);
-    MULTI_GAUGE_SET(kv_cache_dp_utilization_perc, rank_label, 50.0);
-    for (const auto& [type, ratio] : utilization[dp_rank]) {
-      MULTI_GAUGE_SET_2_LABELS(block_type_dp_utilization_perc,
-                               block_type_label(type),
-                               rank_label,
-                               25.0);
-    }
-  }
-  MULTI_GAUGE_SET(kv_cache_dp_utilization_perc, "9", 75.0);
-  // Removing the layout clears utilization for every actual DP/leaf, including
-  // LINEAR and EMBEDDING, which were not in the occupancy layout.
-  pool.set_kv_cache_pool_layout({});
-  for (size_t dp_rank = 0; dp_rank < utilization.size(); ++dp_rank) {
-    const std::string rank_label = std::to_string(dp_rank);
-    EXPECT_DOUBLE_EQ(
-        MULTI_GAUGE_kv_cache_dp_utilization_perc.get_stats({rank_label})
-            ->get_value(),
-        0.0);
-    for (const auto& [type, ratio] : utilization[dp_rank]) {
-      EXPECT_DOUBLE_EQ(MULTI_GAUGE_block_type_dp_utilization_perc
-                           .get_stats({block_type_label(type), rank_label})
-                           ->get_value(),
-                       0.0);
-    }
-  }
-  EXPECT_DOUBLE_EQ(
-      MULTI_GAUGE_kv_cache_dp_utilization_perc.get_stats({"9"})->get_value(),
-      75.0);
-  MULTI_GAUGE_SET(kv_cache_dp_utilization_perc, "9", 0.0);
-
   pool.deallocate(&active);
   for (const auto& [type, ratio] : pool.block_utilization_by_type_per_dp()[0]) {
     EXPECT_DOUBLE_EQ(ratio, 0.0) << static_cast<int32_t>(type);
   }
-}
-
-TEST(XTensorBlockManagerTest, MappedPagesExcludePaddingAndReserve) {
-  BlockManager::Options options;
-  options.num_blocks(16).block_size(1);
-  XTensorBlockManagerImpl manager(options,
-                                  /*num_layers=*/1,
-                                  /*block_mem_size=*/7,
-                                  /*page_size=*/16);
-  ASSERT_TRUE(manager.pool_usage().has_value());
-  EXPECT_EQ(manager.pool_usage()->occupied_resources, 0);
-  XTensorBlockManagerTestPeer::seed_pages(manager);
-  const auto usage = manager.pool_usage();
-  ASSERT_TRUE(usage.has_value());
-  EXPECT_EQ(usage->usable_resources, 4);
-  EXPECT_EQ(usage->occupied_resources, 2);
-  XTensorBlockManagerTestPeer::set_available(manager, /*count=*/6);
-  EXPECT_FALSE(manager.pool_usage().has_value());
-}
-
-TEST_F(BlockManagerPoolTest, OccupancyCountsEachWorkerAndClearsAfterRelease) {
-  BlockManagerPool::Options options;
-  options.num_blocks(5)
-      .block_size(1)
-      .enable_prefix_cache(false)
-      .model_id("Qwen3-0.6B")
-      .server_idx(1);
-  Sequence active = make_sequence(0, /*prompt_tokens=*/{1, 2});
-  active.set_dp_rank(0);
-  auto* gauge = MULTI_GAUGE_kv_cache_pool_occupied_bytes.get_stats(
-      {"qwen3_0_6_b", "1", "target", "0", "0", "kv"});
-  {
-    BlockManagerPool pool(options, /*dp_size=*/2);
-    pool.set_kv_cache_pool_layout({{BlockType::KV, 5, 64, "target", 0, 0},
-                                   {BlockType::KV, 5, 64, "target", 0, 1},
-                                   {BlockType::KV, 5, 32, "draft", 0, 0},
-                                   {BlockType::KV, 5, 64, "target", 1, 2}});
-    ASSERT_TRUE(pool.try_allocate(&active));
-    pool.report_pool_occupancy();
-    EXPECT_DOUBLE_EQ(gauge->get_value(), 128.0);
-    {
-      auto other_options = options;
-      other_options.model_id("qwen3_0_6_b").server_idx(2);
-      BlockManagerPool other(other_options);
-      other.set_kv_cache_pool_layout({{BlockType::KV, 5, 32, "target"}});
-      Sequence second = make_sequence(1, /*prompt_tokens=*/{3, 4});
-      second.set_dp_rank(0);
-      ASSERT_TRUE(other.try_allocate(&second));
-      other.report_pool_occupancy();
-      EXPECT_DOUBLE_EQ(
-          MULTI_GAUGE_kv_cache_pool_occupied_bytes
-              .get_stats({"qwen3_0_6_b", "2", "target", "0", "0", "kv"})
-              ->get_value(),
-          64.0);
-      other.deallocate(&second);
-    }
-    EXPECT_DOUBLE_EQ(gauge->get_value(), 128.0);
-    EXPECT_DOUBLE_EQ(
-        MULTI_GAUGE_kv_cache_pool_occupied_bytes
-            .get_stats({"qwen3_0_6_b", "1", "target", "0", "1", "kv"})
-            ->get_value(),
-        128.0);
-    EXPECT_DOUBLE_EQ(
-        MULTI_GAUGE_kv_cache_pool_occupied_bytes
-            .get_stats({"qwen3_0_6_b", "1", "draft", "0", "0", "kv"})
-            ->get_value(),
-        64.0);
-    EXPECT_DOUBLE_EQ(
-        MULTI_GAUGE_kv_cache_pool_occupied_bytes
-            .get_stats({"qwen3_0_6_b", "1", "target", "1", "2", "kv"})
-            ->get_value(),
-        0.0);
-    // Re-registering is safe; replacement clears removed series and changes
-    // bytes per resource without changing allocator occupancy.
-    pool.set_kv_cache_pool_layout({{BlockType::KV, 5, 64, "target"}});
-    EXPECT_DOUBLE_EQ(gauge->get_value(), 128.0);
-    pool.set_kv_cache_pool_layout({{BlockType::KV, 7, 32, "target"},
-                                   {BlockType::KV, 5, 0, "target", 0, 1},
-                                   {BlockType::KV, 0, 32, "draft"}});
-    EXPECT_DOUBLE_EQ(gauge->get_value(), 64.0);
-    EXPECT_DOUBLE_EQ(
-        MULTI_GAUGE_kv_cache_pool_occupied_bytes
-            .get_stats({"qwen3_0_6_b", "1", "target", "0", "1", "kv"})
-            ->get_value(),
-        0.0);
-    EXPECT_DOUBLE_EQ(
-        MULTI_GAUGE_kv_cache_pool_occupied_bytes
-            .get_stats({"qwen3_0_6_b", "1", "draft", "0", "0", "kv"})
-            ->get_value(),
-        0.0);
-    pool.deallocate(&active);
-    pool.report_pool_occupancy();
-    EXPECT_DOUBLE_EQ(gauge->get_value(), 0.0);
-    // A final live allocation checks shutdown cleanup as well as idle refresh.
-    ASSERT_TRUE(pool.try_allocate(&active));
-    pool.report_pool_occupancy();
-    pool.deallocate(&active);
-  }
-  EXPECT_DOUBLE_EQ(gauge->get_value(), 0.0);
 }
 
 TEST_F(BlockManagerPoolTest, DeallocateReleasesSingleBlockId) {
@@ -1915,15 +1749,11 @@ TEST(BlockManagerImplTest, RefcountZeroEntersFreeListAndCacheOnlyIsEvictable) {
   EXPECT_EQ(manager.num_used_blocks(), 0u);
   EXPECT_EQ(manager.num_free_blocks(), total - 2);
   EXPECT_EQ(manager.num_available_blocks(), total);
-  const auto resident_usage = manager.pool_usage();
-  ASSERT_TRUE(resident_usage.has_value());
-  EXPECT_EQ(resident_usage->occupied_resources, 2);
 
   {
     std::vector<Block> matched = manager.allocate_shared(tokens);
     ASSERT_EQ(matched.size(), 2u);
     EXPECT_EQ(matched[0].id(), first_id);
-    EXPECT_EQ(manager.pool_usage()->occupied_resources, 2);
     EXPECT_EQ(manager.num_evictable_blocks(), 0u);
     EXPECT_EQ(manager.num_used_blocks(), 2u);
     EXPECT_EQ(manager.num_free_blocks(), total - 2);
@@ -1939,7 +1769,6 @@ TEST(BlockManagerImplTest, RefcountZeroEntersFreeListAndCacheOnlyIsEvictable) {
   EXPECT_EQ(manager.num_used_blocks(), 0u);
   EXPECT_EQ(manager.num_free_blocks(), total);
   EXPECT_EQ(manager.num_available_blocks(), total);
-  EXPECT_EQ(manager.pool_usage()->occupied_resources, 0);
 }
 
 // Block ids restart on every leaf. Caching one leaf's block into another

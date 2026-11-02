@@ -51,17 +51,6 @@ limitations under the License.
 namespace xllm {
 namespace {
 
-void fill_kv_cache_pool_layout(const std::vector<KVCachePoolLayout>& pools,
-                               proto::AllocateKVCacheResponse* response) {
-  for (const auto& pool : pools) {
-    auto* entry = response->add_pool_layout();
-    entry->set_block_type(static_cast<proto::BlockType>(pool.block_type));
-    entry->set_resource_count(pool.resource_count);
-    entry->set_bytes_per_resource(pool.bytes_per_resource);
-    entry->set_cache_role(pool.cache_role);
-  }
-}
-
 int32_t get_num_decode_seqs_for_schedule_overlap(const ForwardInput& input) {
   if (input.sampling_params.sample_idxes.defined()) {
     return static_cast<int32_t>(input.sampling_params.sample_idxes.size(0));
@@ -626,7 +615,7 @@ void WorkerService::ProfileDeviceMemory(
 void WorkerService::AllocateKVCache(
     ::google::protobuf::RpcController* controller,
     const proto::AllocateKVCacheRequest* request,
-    proto::AllocateKVCacheResponse* response,
+    proto::Status* response,
     ::google::protobuf::Closure* done) {
   threadpool_->schedule([this, controller, request, response, done]() mutable {
     brpc::ClosureGuard done_guard(done);
@@ -635,9 +624,6 @@ void WorkerService::AllocateKVCache(
     auto future = worker_->allocate_kv_cache_async(kv_cache_shape);
     bool status = std::move(future).get();
     response->set_ok(status);
-    if (status) {
-      fill_kv_cache_pool_layout(worker_->kv_cache_pool_layout(), response);
-    }
   });
   return;
 }
@@ -662,7 +648,7 @@ void WorkerService::SetSpeculativeValidateTimePredictor(
 void WorkerService::AllocateKVCacheWithTransfer(
     ::google::protobuf::RpcController* controller,
     const proto::AllocateKVCacheRequest* req,
-    proto::AllocateKVCacheResponse* resp,
+    proto::Status* resp,
     ::google::protobuf::Closure* done) {
   threadpool_->schedule([this, controller, req, resp, done]() mutable {
     brpc::ClosureGuard done_guard(done);
@@ -672,9 +658,6 @@ void WorkerService::AllocateKVCacheWithTransfer(
         worker_->allocate_kv_cache_with_transfer_async(kv_cache_shape);
     bool status = std::move(future).get();
     resp->set_ok(status);
-    if (status) {
-      fill_kv_cache_pool_layout(worker_->kv_cache_pool_layout(), resp);
-    }
   });
   return;
 }

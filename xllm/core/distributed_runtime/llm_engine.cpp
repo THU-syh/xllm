@@ -691,7 +691,6 @@ bool LLMEngine::allocate_kv_cache(const KVCacheCapacity& kv_cache_cap) {
       .num_layers(args_.n_layers())
       .slot_size(kv_cache_cap.slot_size())
       .model_id(options_.model_id())
-      .server_idx(options_.server_idx())
       .model_type(args_.model_type())
       .max_seqs_per_batch(options_.max_seqs_per_batch())
       .num_speculative_tokens(options_.num_speculative_tokens())
@@ -827,9 +826,6 @@ bool LLMEngine::allocate_kv_cache(const KVCacheCapacity& kv_cache_cap) {
   kv_cache_manager_->reserve_xtensor_padding_blocks();
 
   if (!options_.is_draft_engine()) {
-    // Shared workers return both roles; only the target pool allocates
-    // sequences.
-    register_kv_cache_pool_layout(worker_clients_, dp_size_);
     if (!options.manager_types().empty() || kv_cache_config.enable_xtensor()) {
       LOG(INFO) << "KV token capacity: N/A ("
                 << (kv_cache_config.enable_xtensor() ? "XTensor"
