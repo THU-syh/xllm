@@ -1167,11 +1167,10 @@ class Glm5NextIndexer(nn.Module):
         if not in_acl_graph() and not bool(attention_mask.all().item()):
             # The fused kernel consumes one query per row. Exclude padding
             # before execution, then restore its sentinel rows in logical order.
-            # The compact layout appends the partial tail, which the dense path
-            # only does when the tail is always selected; without that flag a
-            # padded fused row would attend tokens the dense path excludes.
-            if not self.index_kpool_always_select_tail:
-                return None
+            # ``kernel_tail_k`` below is zero when the tail is not always
+            # selected, which matches the dense path's candidate pool set
+            # (``read_pools`` marks the partial pool invalid), so padded batches
+            # stay on the fused path for both tail-selection modes.
             valid_rows = attention_mask.reshape(-1).nonzero(as_tuple=True)[0]
             if valid_rows.numel() == 0:
                 return torch.full(

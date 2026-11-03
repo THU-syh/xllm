@@ -265,14 +265,12 @@ def test_unpadded_and_graph_preserve_original_kernel_contract(
 
 
 @torch.inference_mode()
-def test_padding_without_tail_selection_falls_back_to_dense(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Default flag (``index_kpool_always_select_tail=False``) must not compact.
+def test_padding_without_tail_selection_stays_fused_with_zero_tail(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Default flag (``index_kpool_always_select_tail=False``) stays fused.
 
-    The compacted path derives its output width and its candidate pools without
-    the partial tail pool, so entering it with the default flag would silently
-    drop the most recent ``token_count % index_kpool`` tokens.  Padded batches
-    therefore have to fall back to the dense implementation, which handles the
-    tail explicitly.
+    The dense path marks the partial pool invalid (``read_pools``) and does not
+    append the tail, so the fused call passes a zero tail and keeps the padded
+    batch on the fast path instead of falling back to dense.
     """
     indexer = _make_indexer(torch.device("cpu"))
     indexer.index_kpool_always_select_tail = False
@@ -281,12 +279,20 @@ def test_padding_without_tail_selection_falls_back_to_dense(monkeypatch: pytest.
     mask = torch.ones(2, 1, dtype=torch.bool)
     mask[1, 0] = False
     tables = torch.tensor([[1, 2], [3, 4]], dtype=torch.int32)
-    lengths = torch.tensor([16, 16], dtype=torch.int32)
-    calls: list[bool] = []
+    lengths = torch.tensor([14, 14], dtype=torch.int32)
+    calls = []
 
-    def _kernel(*args: object, **kwargs: object) -> None:
-        calls.append(True)
-        raise AssertionError("fused kernel must not run for padded batches without tail selection")
+    def _kernel(
+        q: torch.Tensor,
+        cache: torch.Tensor,
+        w: torch.Tensor,
+        tail: torch.Tensor,
+        topk: int,
+        pool_size: int,
+        **_kwargs: object,
+    ) -> tuple[torch.Tensor, None]:
+        calls.append((tail.clone(), topk, pool_size))
+        return torch.arange(8, dtype=torch.int32).reshape(1, 1, 8), None
 
     monkeypatch.setattr(glm5_next.kernels, "pool_key_indexer", _kernel, raising=False)
     result = indexer._select_topk_fused_pa(
@@ -297,8 +303,50 @@ def test_padding_without_tail_selection_falls_back_to_dense(monkeypatch: pytest.
         torch.zeros(8, 4, 1, 128, dtype=torch.bfloat16),
         tables,
     )
-    assert result is None, "padded batch without tail selection must fall back to dense"
-    assert not calls
+    assert result is not None, "padded batch without tail selection must stay fused"
+    assert len(calls) == 1
+    tail, topk, pool_size = calls[0]
+    assert (topk, pool_size) == (8, 4)
+    torch.testing.assert_close(tail, torch.zeros_like(tail))
+    assert result.shape == (2, 1, 8)
+    assert result[0, 0].tolist() == list(range(8))
+    assert bool((result[1, 0] == -1).all().item())
+
+
+@pytest.mark.skipif(not os.getenv("XLLM_KDA_TEST_NPU_DEVICE"), reason="NPU device not configured")
+@torch.inference_mode()
+def test_real_npu_padding_without_tail_selection_stays_fused(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Real NPU: a padded row without tail selection keeps the complete pools."""
+    pytest.importorskip("torch_npu")
+    from xllm.python.kernels_npu.sparse_attention import pool_key_indexer
+
+    device = torch.device(os.environ["XLLM_KDA_TEST_NPU_DEVICE"])
+    torch.npu.set_device(device)
+    monkeypatch.setattr(glm5_next.kernels, "pool_key_indexer", pool_key_indexer, raising=False)
+    indexer = _make_indexer(device)
+    indexer.index_kpool_always_select_tail = False
+
+    query = torch.ones(2, 1, indexer.n_heads, indexer.head_dim, device=device, dtype=torch.bfloat16)
+    weights = torch.ones(2, 1, indexer.n_heads, device=device, dtype=torch.bfloat16)
+    mask = torch.tensor([[True], [False]], device=device)
+    lengths = torch.tensor([14, 14], device=device, dtype=torch.int32)
+    cache = torch.zeros(2, 16, 1, indexer.head_dim, device=device, dtype=torch.bfloat16)
+    pool_values = torch.arange(1, 5, device=device, dtype=torch.bfloat16).view(1, 4, 1, 1)
+    cache[:, :4].copy_(pool_values.expand(2, -1, 1, indexer.head_dim))
+    tables = torch.tensor([[0], [1]], device=device, dtype=torch.int32)
+
+    result = indexer._select_topk_fused_pa(query, weights, lengths, mask, cache, tables)
+    assert result is not None
+    assert result.shape == (2, 1, indexer.topk)
+    row = result[0, 0]
+    valid = row[row >= 0]
+    assert valid.numel() == indexer.topk
+    assert not (row[: indexer.topk] < 0).any()
+    # Three complete pools (tokens 0..11) are candidates; the two highest-scoring
+    # ones are pools 2 and 1, returned in score order as tokens 8..11 and 4..7.
+    # The partial tail (12, 13) is not selected because tail selection is disabled.
+    torch.testing.assert_close(valid.sort().values.cpu(), torch.arange(4, 12, dtype=torch.int64))
+    assert bool((result[1, 0] == -1).all().item())
 
 
 def test_non_divisible_topk_falls_back_to_dense(monkeypatch: pytest.MonkeyPatch) -> None:
