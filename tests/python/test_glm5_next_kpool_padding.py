@@ -349,6 +349,38 @@ def test_real_npu_padding_without_tail_selection_stays_fused(monkeypatch: pytest
     assert bool((result[1, 0] == -1).all().item())
 
 
+@pytest.mark.skipif(not os.getenv("XLLM_KDA_TEST_NPU_DEVICE"), reason="NPU device not configured")
+@torch.inference_mode()
+def test_real_npu_unpadded_without_tail_selection_skips_the_tail(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Real NPU: unpadded short rows without tail selection keep complete pools only."""
+    pytest.importorskip("torch_npu")
+    from xllm.python.kernels_npu.sparse_attention import pool_key_indexer
+
+    device = torch.device(os.environ["XLLM_KDA_TEST_NPU_DEVICE"])
+    torch.npu.set_device(device)
+    monkeypatch.setattr(glm5_next.kernels, "pool_key_indexer", pool_key_indexer, raising=False)
+    indexer = _make_indexer(device)
+    indexer.index_kpool_always_select_tail = False
+
+    query = torch.ones(1, 1, indexer.n_heads, indexer.head_dim, device=device, dtype=torch.bfloat16)
+    weights = torch.ones(1, 1, indexer.n_heads, device=device, dtype=torch.bfloat16)
+    mask = torch.ones(1, 1, device=device, dtype=torch.bool)
+    lengths = torch.tensor([14], device=device, dtype=torch.int32)
+    cache = torch.zeros(1, 16, 1, indexer.head_dim, device=device, dtype=torch.bfloat16)
+    pool_values = torch.arange(1, 5, device=device, dtype=torch.bfloat16).view(1, 4, 1, 1)
+    cache[:, :4].copy_(pool_values.expand(1, -1, 1, indexer.head_dim))
+    tables = torch.tensor([[0]], device=device, dtype=torch.int32)
+
+    result = indexer._select_topk_fused_pa(query, weights, lengths, mask, cache, tables)
+    assert result is not None
+    assert result.shape == (1, 1, indexer.topk)
+    row = result[0, 0]
+    valid = row[row >= 0]
+    assert valid.numel() == indexer.topk
+    # Complete pools only: tokens 4..11; the partial tail 12,13 is not selected.
+    torch.testing.assert_close(valid.sort().values.cpu(), torch.arange(4, 12, dtype=torch.int64))
+
+
 def test_non_divisible_topk_falls_back_to_dense(monkeypatch: pytest.MonkeyPatch) -> None:
     """A non-divisible topk must not truncate ``topk // index_kpool``.
 
