@@ -26,6 +26,10 @@ limitations under the License.
 #include "core/framework/model/model_input_params.h"
 #include "core/layers/common/attention_metadata.h"
 #include "core/util/pybind_helper.h"
+#if defined(USE_NPU)
+#include <ATen/core/CachingHostAllocator.h>
+#include <torch_npu/csrc/core/npu/NPUStream.h>
+#endif
 
 namespace py = pybind11;
 
@@ -262,10 +266,29 @@ PyAttentionMetadataView::PyAttentionMetadataView(
   num_accepted_tokens_ = params.num_accepted_tokens;
   if (!params.embedding.engram_lookback_token_ids.empty()) {
     CHECK_GT(params.execution_batch.num_reqs, 0);
-    engram_lookback_token_ids_ =
+    torch::Tensor lookback =
         torch::tensor(params.embedding.engram_lookback_token_ids, torch::kInt32)
-            .reshape({params.execution_batch.num_reqs, -1})
-            .to(metadata_->slot_mapping.device());
+            .reshape({params.execution_batch.num_reqs, -1});
+    if (!metadata_->slot_mapping.device().is_cpu()) {
+      // Retain the pinned source for the asynchronous H2D copy.
+      engram_lookback_host_staging_ = lookback.pin_memory();
+      lookback = engram_lookback_host_staging_;
+    }
+    const torch::Device& device = metadata_->slot_mapping.device();
+    engram_lookback_token_ids_ = lookback.to(device, /*non_blocking=*/true);
+#if defined(USE_NPU)
+    if (engram_lookback_host_staging_.defined()) {
+      // CPU tensors do not implement Tensor::record_stream. Register the
+      // pinned allocation directly so it cannot be reused before H2D completes.
+      CHECK(at::getHostAllocator(c10::DeviceType::PrivateUse1)
+                ->record_event(
+                    engram_lookback_host_staging_.data_ptr(),
+                    engram_lookback_host_staging_.storage()
+                        .data_ptr()
+                        .get_context(),
+                    c10_npu::getCurrentNPUStream(device.index()).unwrap()));
+    }
+#endif
   }
   if (!params.embedding.linear_state_read_ids.empty() &&
       (metadata_->is_prefill || metadata_->is_chunked_prefill) &&

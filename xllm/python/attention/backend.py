@@ -336,6 +336,13 @@ class MlaUnabsorbedPrefill:
 
 
 class AttentionBackend(ABC):
+    # Opt in when target graph inputs and Engram staging can overlap draft execution.
+    supports_draft_to_target_overlap: bool = False
+
+    def graph_uses_dsa_metadata(self, metadata: AttentionMetadata) -> bool:
+        """Whether this graph uses the DSA metadata path."""
+        return False
+
     def set_device_only_decode_inputs(self, enabled: bool, query_width: int) -> None:
         if enabled:
             raise NotImplementedError("This attention backend does not support device-only decode inputs")

@@ -1215,8 +1215,16 @@ class Csa2AttentionBackend(DsaAttentionBackend):
             window_size,
             n_layers,
         )
-        self._builder = DsaMetadataBuilder(self.caches_info, self.group_infos, read_table_layout=READ_TABLE_LAYOUT_RING)
         self._block_query_width = block_query_width
+        # Only the target owns DSA refresh and Engram staging for this overlap.
+        # The block-query backend is the draft and keeps its existing input path.
+        self.supports_draft_to_target_overlap = block_query_width == 0
+        self._builder = DsaMetadataBuilder(
+            self.caches_info,
+            self.group_infos,
+            read_table_layout=READ_TABLE_LAYOUT_RING,
+            async_graph_refresh=self.supports_draft_to_target_overlap,
+        )
 
         if block_query_width and (
             len(self.group_infos) != 1 or self.group_infos[0].cache_type != DSA_CACHE_SLIDING_WINDOW
@@ -1287,6 +1295,7 @@ class Csa2AttentionBackend(DsaAttentionBackend):
         # a plain Python int computed before capture (never a captured tensor).
         self._swa_ring_blocks = self._compute_swa_ring_blocks()
         self._metadata: Any | None = None
+        self._metadata_staging: dict[tuple[torch.device, torch.dtype, torch.Size], list[tuple[torch.Tensor, Any]]] = {}
         self._v41_shared: CSA2SharedRuntime | None = None
         # Persistent QLI v3 indexer operands, one entry per (batch_rows,
         # token capacity) graph bucket; built in warmup, refreshed under capture.
@@ -1344,6 +1353,11 @@ class Csa2AttentionBackend(DsaAttentionBackend):
         else:
             super().prepare(metadata, graph_mode=graph_mode)
 
+    def graph_uses_dsa_metadata(self, metadata: Any) -> bool:
+        """Target CSA2 graphs use DSA metadata from scheduler host tables."""
+        dsa = getattr(metadata, "dsa_metadata", None)
+        return self.supports_draft_to_target_overlap and dsa is not None and dsa.is_acl_graph
+
     def refresh_dsa_metadata_for_graph_replay(self, metadata: Any | None = None) -> None:
         """Refresh DSA tensors and the QLI operand buffers outside capture.
 
@@ -1361,8 +1375,18 @@ class Csa2AttentionBackend(DsaAttentionBackend):
         dsa = getattr(resolved, "dsa_metadata", None)
         if dsa is None:
             return
+        if not getattr(dsa, "qli_refresh_in_target_graph", False):
+            for state in self._qli_replay_states(dsa):
+                self._refresh_qli_state(dsa, state)
+
+    def prepare_graph_forward(self, metadata: Any) -> None:
+        """Capture QLI operand refresh at the beginning of the target graph."""
+        dsa = getattr(metadata, "dsa_metadata", None)
+        if dsa is None or not dsa.is_acl_graph:
+            return
         for state in self._qli_replay_states(dsa):
             self._refresh_qli_state(dsa, state)
+        dsa.qli_refresh_in_target_graph = True
 
     def _qli_replay_states(self, dsa: DsaMetadata) -> list[_QliGraphState]:
         """The QLI states matching one replay's (rows, capacity) bucket, if any."""
@@ -1373,8 +1397,18 @@ class Csa2AttentionBackend(DsaAttentionBackend):
         state = self._qli_state.get(key)
         return [state] if state is not None else []
 
-    def _build_dsa_metadata_for_forward(self, metadata: Any, *, group_limit: int | None = None) -> DsaMetadata:
-        dsa = super()._build_dsa_metadata_for_forward(metadata, group_limit=group_limit)
+    def _build_dsa_metadata_for_forward(
+        self,
+        metadata: Any,
+        *,
+        group_limit: int | None = None,
+        inplace_target: DsaMetadata | None = None,
+    ) -> DsaMetadata:
+        dsa = super()._build_dsa_metadata_for_forward(
+            metadata,
+            group_limit=group_limit,
+            inplace_target=inplace_target,
+        )
         if bool(getattr(metadata, "is_dummy", False)):
             # The shared V4 builder gives empty-DP rows a synthetic 512-token
             # context for native operator tiling. CSA2 runs tensor attention:
@@ -1391,9 +1425,9 @@ class Csa2AttentionBackend(DsaAttentionBackend):
             # synthetic query. CSA2 RoPE uses ctx.positions instead; negative
             # history is clamped for gathers and masked before cache writes.
             dsa.start_pos.copy_(-dsa.seq_lens_q)
-            for layer_slots in dsa.slot_mappings:
-                for slots in layer_slots:
-                    slots.fill_(-1)
+            slots_by_address = {slots.data_ptr(): slots for layer_slots in dsa.slot_mappings for slots in layer_slots}
+            for slots in slots_by_address.values():
+                slots.fill_(-1)
         return dsa
 
     def _build_precomputed_metadata(

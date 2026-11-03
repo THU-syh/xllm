@@ -664,10 +664,17 @@ std::optional<ForwardOutput> DFlashWorkerImpl::step_empty(
       speculative_worker::run_worker_no_sync(
           *impl_, validate_input, *prepare_stream_, *compute_stream_)
           .value();
-  // See above: sync the no-sync draft and target forwards before returning.
-  compute_stream_->synchronize();
+  finish_empty_decode(input, output, draft_output);
   clear_all_output_embeddings(output);
   return output;
+}
+
+void DFlashWorkerImpl::finish_empty_decode(
+    const ForwardInput& /*input*/,
+    ForwardOutput& /*output*/,
+    std::optional<ForwardOutput>& /*draft_output*/) {
+  // See above: sync the no-sync draft and target forwards before returning.
+  compute_stream_->synchronize();
 }
 
 std::optional<ForwardOutput> DFlashWorkerImpl::step_prefill(

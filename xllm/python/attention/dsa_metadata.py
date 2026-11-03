@@ -31,7 +31,7 @@ backend builds it here from the same inputs.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Sequence
+from typing import Any, Sequence
 
 import torch
 
@@ -155,6 +155,11 @@ class DsaMetadata:
     # Tensor fields above may be views into this buffer, matching C++
     # DSAMetadata::packed_metadata_buffer.
     packed_metadata_buffer: torch.Tensor | None = None
+
+    # The query layout is fixed within a graph bucket. Keep its host truth so
+    # replay only uploads query descriptors when that layout actually changes.
+    query_lengths_host: tuple[int, ...] = ()
+    qli_refresh_in_target_graph: bool = False
 
     is_acl_graph: bool = False
 
@@ -375,6 +380,8 @@ class DsaMetadataBuilder:
         caches_info: list[list[DSACacheInfo]],
         group_infos: list[DSAGroupInfo],
         read_table_layout: str = READ_TABLE_LAYOUT_RIGHT_ALIGNED,
+        *,
+        async_graph_refresh: bool = False,
     ) -> None:
         if read_table_layout not in (READ_TABLE_LAYOUT_RIGHT_ALIGNED, READ_TABLE_LAYOUT_RING):
             raise ValueError(
@@ -388,6 +395,28 @@ class DsaMetadataBuilder:
         # shared-path behaviour (DSV4 / V4-dspark); ``"ring"`` is requested by
         # the DeepSeek-V4.1 backend whose readers need every column addressed.
         self.read_table_layout = read_table_layout
+        self.async_graph_refresh = async_graph_refresh
+        self._pinned_uploads: dict[tuple[torch.device, torch.dtype, torch.Size], list[tuple[torch.Tensor, Any]]] = {}
+
+    def _copy_to_destination(self, dst: torch.Tensor, source: torch.Tensor, *, non_blocking: bool = True) -> None:
+        if not (self.async_graph_refresh and non_blocking and source.device.type == "cpu" and dst.device.type == "npu"):
+            dst.copy_(source, non_blocking=non_blocking)
+            return
+        # Reuse a staging allocation only after its preceding H2D completes.
+        # Shape alone is insufficient: several fields with the same shape can
+        # be uploaded concurrently, including on different preparation streams.
+        key = (dst.device, source.dtype, source.shape)
+        uploads = self._pinned_uploads.setdefault(key, [])
+        for staged, completed in uploads:
+            if completed.query():
+                break
+        else:
+            staged = torch.empty(source.shape, dtype=source.dtype, device="cpu", pin_memory=True)
+            completed = torch.npu.Event()
+            uploads.append((staged, completed))
+        staged.copy_(source)
+        dst.copy_(staged, non_blocking=True)
+        completed.record(torch.npu.current_stream(dst.device))
 
     # -- public API ---------------------------------------------------------
 
@@ -421,8 +450,8 @@ class DsaMetadataBuilder:
         the ACL graph. When every shape matches, the value-derived fields are
         written straight into those buffers and the returned metadata aliases
         them, so the replay copy chain degenerates to a shape/alias
-        assertion. ``None`` (the default and the only value the replay path
-        passes) keeps the historical build byte-for-byte.
+        assertion. ``None`` allocates fresh storage for eager execution and
+        graph capture.
         """
         batch_size = len(kv_seq_lens)
         if q_seq_lens is None or len(q_seq_lens) != batch_size:
@@ -527,12 +556,14 @@ class DsaMetadataBuilder:
             # the last real value. Harmless today (the decode ACL path never
             # consumes ``kv_cu_seq_lens``) but MUST be revisited if a future
             # consumer reads the cumulative axis across pad lanes.
-            dst.seq_lens.copy_(kv, non_blocking=True)
-            dst.seq_lens_q.copy_(q, non_blocking=True)
-            dst.actual_seq_lengths_query.copy_(actual_seq_lengths_query, non_blocking=True)
-            dst.kv_cu_seq_lens.copy_(kv_cu, non_blocking=True)
-            dst.max_seqlen_kv.copy_(max_kv, non_blocking=True)
-            dst.max_seqlen_q.copy_(max_q, non_blocking=True)
+            self._copy_to_destination(dst.seq_lens, kv)
+            if not self.async_graph_refresh or dst.query_lengths_host != tuple(q_lens):
+                self._copy_to_destination(dst.seq_lens_q, q)
+                self._copy_to_destination(dst.actual_seq_lengths_query, actual_seq_lengths_query)
+                self._copy_to_destination(dst.max_seqlen_q, max_q)
+                dst.query_lengths_host = tuple(q_lens)
+            self._copy_to_destination(dst.kv_cu_seq_lens, kv_cu)
+            self._copy_to_destination(dst.max_seqlen_kv, max_kv)
             dst.max_query_len = max_query_len
             dst.max_seq_len = max_seq_len
             dst.layer_id = -1
@@ -551,6 +582,7 @@ class DsaMetadataBuilder:
                 c4_pad_positions=torch.empty(0, dtype=torch.int64),
                 c128_pad_positions=torch.empty(0, dtype=torch.int64),
                 start_pos=torch.empty(0),
+                query_lengths_host=tuple(q_lens),
             )
         return DsaMetadata(
             layer_id=-1,
@@ -567,6 +599,7 @@ class DsaMetadataBuilder:
             c4_pad_positions=torch.empty(0, dtype=torch.int64),
             c128_pad_positions=torch.empty(0, dtype=torch.int64),
             start_pos=torch.empty(0),
+            query_lengths_host=tuple(q_lens),
         )
 
     @staticmethod
@@ -651,15 +684,14 @@ class DsaMetadataBuilder:
         dsa.c4_pad_positions = self._write_positions(dst, "c4_pad_positions", _pad(c4_positions, 4))
         dsa.c128_pad_positions = self._write_positions(dst, "c128_pad_positions", _pad(c128_positions, 128))
 
-    @staticmethod
-    def _write_positions(dst: DsaMetadata | None, name: str, source: torch.Tensor) -> torch.Tensor:
+    def _write_positions(self, dst: DsaMetadata | None, name: str, source: torch.Tensor) -> torch.Tensor:
         """Write a compressed-position vector into its captured buffer if possible."""
         if dst is None:
             return source
         target = getattr(dst, name, None)
         if target is None or target.dtype != source.dtype or target.shape != source.shape:
             return source
-        target.copy_(source, non_blocking=True)
+        self._copy_to_destination(target, source)
         return target
 
     # -- step 3: block_tables / slot_mappings (build_dsa_fields, cpp:169-264)
@@ -792,8 +824,8 @@ class DsaMetadataBuilder:
                 return block, slot
         return None, None
 
-    @staticmethod
     def _block_table_dst_ok(
+        self,
         dst_bt: torch.Tensor | None,
         raw_bt: torch.Tensor,
         batch_size: int,
@@ -803,17 +835,22 @@ class DsaMetadataBuilder:
             dst_bt is not None
             and dst_bt.dtype == torch.int32
             and dst_bt.dim() == 2
-            and dst_bt.device == raw_bt.device
+            and (
+                dst_bt.device == raw_bt.device
+                or (self.async_graph_refresh and raw_bt.device.type == "cpu" and dst_bt.device.type == "npu")
+            )
             and dst_bt.size(0) >= batch_size
             and dst_bt.size(1) == cols
         )
 
-    @staticmethod
-    def _slot_dst_ok(dst_slots: torch.Tensor | None, raw_bt: torch.Tensor, rows: int) -> bool:
+    def _slot_dst_ok(self, dst_slots: torch.Tensor | None, raw_bt: torch.Tensor, rows: int) -> bool:
         return (
             dst_slots is not None
             and dst_slots.dtype == torch.int32
-            and dst_slots.device == raw_bt.device
+            and (
+                dst_slots.device == raw_bt.device
+                or (self.async_graph_refresh and raw_bt.device.type == "cpu" and dst_slots.device.type == "npu")
+            )
             and dst_slots.numel() == rows
         )
 
@@ -923,7 +960,7 @@ class DsaMetadataBuilder:
                 write_idx += 1
         if use_dst_slots:
             out_slots = dst_slots
-            out_slots.copy_(torch.tensor(slots_list, dtype=torch.int32), non_blocking=True)
+            self._copy_to_destination(out_slots, torch.tensor(slots_list, dtype=torch.int32))
         else:
             out_slots = torch.tensor(slots_list, dtype=torch.int32, device=raw_bt.device)
 
@@ -936,7 +973,9 @@ class DsaMetadataBuilder:
                 rows = min(batch_size, int(raw_bt.size(0)))
                 copy_cols = min(int(raw_bt.size(1)), cap)
                 if rows > 0 and copy_cols > 0:
-                    out_bt[:rows, :copy_cols] = raw_bt[:rows, :copy_cols]
+                    self._copy_to_destination(
+                        out_bt[:rows, :copy_cols], raw_bt[:rows, :copy_cols], non_blocking=self.async_graph_refresh
+                    )
             else:
                 out_bt = self._pad_block_table(raw_bt, batch_size, cap, -1)
         return out_bt, out_slots
@@ -1017,7 +1056,7 @@ class DsaMetadataBuilder:
                         slots_list[write_idx] = slot_for_position(seq, q_start + i)
                         write_idx += 1
             if use_dst_slots:
-                out_slots.copy_(torch.tensor(slots_list, dtype=torch.int32), non_blocking=True)
+                self._copy_to_destination(out_slots, torch.tensor(slots_list, dtype=torch.int32))
             else:
                 out_slots = torch.tensor(slots_list, dtype=torch.int32, device=raw_bt.device)
 
@@ -1077,7 +1116,7 @@ class DsaMetadataBuilder:
                 # `max_dst_len` columns (up to the graph storage width) with one
                 # device op each on every forward would cost ~151x-2141x more.
                 cols = torch.arange(max_dst_len, device=raw_bt.device) % semantic_cols
-                new_bt[:rows] = raw_bt[:rows, cols]
+                self._copy_to_destination(new_bt[:rows], raw_bt[:rows, cols], non_blocking=self.async_graph_refresh)
         else:
             for s in range(batch_size):
                 if s >= raw_bt.size(0):

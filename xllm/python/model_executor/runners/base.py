@@ -16,6 +16,9 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
+from concurrent.futures import Future
+from dataclasses import dataclass
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -31,6 +34,15 @@ from xllm.python.model_executor.input_batch import InputBatch
 from xllm.python.model_executor.model_output import DraftProposal, ModelOutput
 
 ModelExecutionOutput = torch.Tensor | tuple[torch.Tensor, torch.Tensor] | ModelOutput
+
+
+@dataclass(frozen=True)
+class GraphInputPreparation:
+    """Device readiness and host failure propagation for deferred graph inputs."""
+
+    # None when the model captures its readiness wait inside the graph.
+    ready_event: Any
+    completion: Future[None]
 
 
 class BaseRunner(ABC):

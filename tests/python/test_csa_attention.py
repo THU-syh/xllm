@@ -27,8 +27,8 @@ from typing import Any
 import pytest
 import torch
 
-from xllm.python import kernels
 import xllm.python.attention.csa2_attention as csa2
+from xllm.python import kernels
 from xllm.python.attention import csa_attention as csa_attention_module
 from xllm.python.attention import dsa_metadata as dsa_metadata_module
 from xllm.python.attention.backend import LayerCache
@@ -1764,6 +1764,8 @@ def test_alias_dedup_keeps_last_write_for_shared_target_distinct_sources() -> No
     expected = torch.full((4, 2), -1, dtype=torch.int32)
     expected[:2] = 22
     assert torch.equal(target, expected)
+
+
 def test_move_metadata_to_device_still_moves_cpu_fields(monkeypatch) -> None:
     # A differing backend device must still trigger a real move for every
     # tensor, so eager (CPU-pinned scheduler tables) keeps working.
@@ -1785,6 +1787,115 @@ def test_move_metadata_to_device_still_moves_cpu_fields(monkeypatch) -> None:
 
     # seq_lens + one block table + one slot mapping.
     assert calls == ["meta", "meta", "meta"]
+
+
+def test_graph_metadata_h2d_staging_lives_until_event_completes(monkeypatch: pytest.MonkeyPatch) -> None:
+    backend = _make_backend(torch.device("npu:0"))
+    backend.supports_draft_to_target_overlap = True
+    metadata = SimpleNamespace(
+        is_acl_graph=True,
+        seq_lens=torch.tensor([1, 2], dtype=torch.int32),
+        block_tables=[],
+        slot_mappings=[],
+    )
+
+    class CompletionEvent:
+        def __init__(self) -> None:
+            self.complete = False
+            self.recorded_stream = None
+
+        def query(self) -> bool:
+            return self.complete
+
+        def record(self, stream: object) -> None:
+            self.recorded_stream = stream
+
+    class DeviceTensor:
+        def __init__(self, device: torch.device) -> None:
+            self.device = device
+
+    current_stream = object()
+    events: list[CompletionEvent] = []
+    monkeypatch.setattr(
+        torch,
+        "npu",
+        SimpleNamespace(
+            Event=lambda: events.append(CompletionEvent()) or events[-1], current_stream=lambda _: current_stream
+        ),
+        raising=False,
+    )
+    original_empty = torch.empty
+    staging: list[torch.Tensor] = []
+
+    def allocate(*args: object, **kwargs: object) -> torch.Tensor:
+        assert kwargs.pop("pin_memory") is True
+        tensor = original_empty(*args, **kwargs)
+        staging.append(tensor)
+        return tensor
+
+    monkeypatch.setattr(torch, "empty", allocate)
+    transfers: list[tuple[torch.Tensor, torch.device, bool]] = []
+
+    def transfer(tensor: torch.Tensor, device: torch.device, *, non_blocking: bool = False) -> DeviceTensor:
+        transfers.append((tensor, device, non_blocking))
+        return DeviceTensor(device)
+
+    monkeypatch.setattr(torch.Tensor, "to", transfer)
+
+    source = metadata.seq_lens
+    backend._move_metadata_to_device(metadata, tensor_fields=("seq_lens",), move_tables=False)
+    metadata.seq_lens = source + 10
+    backend._move_metadata_to_device(metadata, tensor_fields=("seq_lens",), move_tables=False)
+
+    assert len(staging) == 2
+    assert len(events) == 2
+    assert transfers[0][0] is staging[0]
+    assert transfers[1][0] is staging[1]
+    assert transfers[0][2] is True and transfers[1][2] is True
+    assert events[0].recorded_stream is current_stream
+    torch.testing.assert_close(staging[0], source)
+    torch.testing.assert_close(staging[1], source + 10)
+    assert all(
+        any(staged is saved for saved in staging)
+        for uploads in backend._metadata_staging.values()
+        for staged, _ in uploads
+    )
+
+    events[0].complete = True
+    metadata.seq_lens = source + 20
+    backend._move_metadata_to_device(metadata, tensor_fields=("seq_lens",), move_tables=False)
+
+    assert len(staging) == 2
+    assert transfers[2][0] is staging[0]
+    torch.testing.assert_close(staging[0], source + 20)
+
+
+def test_eager_metadata_move_keeps_synchronous_copy(monkeypatch: pytest.MonkeyPatch) -> None:
+    device = torch.device("npu:0")
+    backend = _make_backend(device)
+    backend.supports_draft_to_target_overlap = True
+    metadata = SimpleNamespace(
+        is_acl_graph=False,
+        seq_lens=torch.tensor([1, 2], dtype=torch.int32),
+        block_tables=[],
+        slot_mappings=[],
+    )
+
+    class DeviceTensor:
+        def __init__(self, target: torch.device) -> None:
+            self.device = target
+
+    transfers: list[tuple[torch.device, bool]] = []
+
+    def transfer(tensor: torch.Tensor, target: torch.device, *, non_blocking: bool = False) -> DeviceTensor:
+        transfers.append((target, non_blocking))
+        return DeviceTensor(target)
+
+    monkeypatch.setattr(torch.Tensor, "to", transfer)
+    backend._move_metadata_to_device(metadata, tensor_fields=("seq_lens",), move_tables=False)
+
+    assert transfers == [(device, False)]
+    assert not backend._metadata_staging
 
 
 # === [Candidate A] In-place refresh ===
@@ -1810,6 +1921,31 @@ def test_off_path_matches_plain_build_and_copy() -> None:
     # The off path never aliases: refreshed tensors are fresh storage.
     assert refreshed_off.seq_lens is not persistent_off.seq_lens
     assert refreshed_off.refresh_inplace_fields == frozenset()
+
+
+def test_graph_host_block_tables_match_device_build_without_device_reads() -> None:
+    backend = _inplace_make_backend()
+    backend.supports_draft_to_target_overlap = True
+    _, metadata = _paired_metadata(seed=3)
+    expected = backend._build_dsa_metadata_for_forward(metadata)
+    metadata.multi_block_tables_host = metadata.multi_block_tables
+    # Shape-only device tables cannot be read back. Every slot and ring table
+    # must instead come from the scheduler's equivalent host copy.
+    metadata.multi_block_tables = tuple(torch.empty_like(table, device="meta") for table in metadata.multi_block_tables)
+    actual = backend._build_dsa_metadata_for_forward(metadata)
+    _assert_fields_equal(expected, actual)
+
+
+def test_graph_host_query_lengths_avoid_device_readback() -> None:
+    backend = _inplace_make_backend()
+    _, metadata = _paired_metadata(seed=3)
+    expected = backend._build_dsa_metadata_for_forward(metadata)
+    metadata.q_seq_lens_host_values = expected.seq_lens_q.tolist()
+    metadata.q_seq_lens_host = None
+    # Reading the device query lengths would fail for a shape-only tensor.
+    metadata.q_seq_lens = torch.empty_like(expected.seq_lens_q, device="meta")
+    actual = backend._build_dsa_metadata_for_forward(metadata)
+    _assert_fields_equal(expected, actual)
 
 
 # -- (b) on/off numerical equivalence ---------------------------------------
@@ -1851,6 +1987,34 @@ def test_inplace_refresh_matches_capture_values_for_same_metadata() -> None:
 
     for name in _INPLACE_FIELDS:
         assert torch.equal(getattr(persistent, name), snapshot[name]), name
+
+
+def test_query_descriptor_reuse_tracks_layout_changes(monkeypatch: pytest.MonkeyPatch) -> None:
+    backend = _inplace_make_backend()
+    backend._builder.async_graph_refresh = True
+    metadata = _inplace_forward_metadata([127, 128, 8193, 8194], seed=3)
+    metadata.q_seq_lens_host_values = [1, 1, 1, 1]
+    persistent = backend._build_dsa_metadata_for_forward(metadata)
+    names = ("seq_lens_q", "actual_seq_lengths_query", "max_seqlen_q")
+    addresses = {getattr(persistent, name).data_ptr() for name in names}
+    copies = []
+    original = backend._builder._copy_to_destination
+
+    def copied(destination: torch.Tensor, source: torch.Tensor, *, non_blocking: bool = True) -> None:
+        if destination.data_ptr() in addresses:
+            copies.append(destination.data_ptr())
+        original(destination, source, non_blocking=non_blocking)
+
+    monkeypatch.setattr(backend._builder, "_copy_to_destination", copied)
+    for values, expected_copies in (([1, 1, 1, 1], 0), ([2, 1, 2, 1], 3), ([2, 1, 2, 1], 0), ([1, 1, 1, 1], 3)):
+        copies.clear()
+        metadata.q_seq_lens_host_values = values
+        backend._build_dsa_metadata_for_forward(metadata, inplace_target=persistent)
+        expected = backend._build_dsa_metadata_for_forward(metadata)
+        for name in names:
+            assert torch.equal(getattr(persistent, name), getattr(expected, name)), name
+        assert len(copies) == expected_copies
+        assert persistent.query_lengths_host == tuple(values)
 
 
 # -- (c) captured-address stability -----------------------------------------
@@ -2148,8 +2312,6 @@ def test_swa_device_refresh_writes_into_captured_storage_in_place() -> None:
     assert torch.equal(persistent_slots, on_slots)
 
 
-
-
 # ---- rope inverse fusion ----
 # R2: fused inverse interleaved RoPE on the V4.1 output de-rotation; a CPU
 # stand-in exercises the dispatch wiring and the |x|<=8 tolerance boundary
@@ -2224,9 +2386,7 @@ def _eager_reference(
     original = csa2._rope_fused_device_supported
     csa2._rope_fused_device_supported = lambda x: False
     try:
-        return csa2.apply_interleaved_rope(
-            x.clone(), positions, cache, inverse=inverse
-        )
+        return csa2.apply_interleaved_rope(x.clone(), positions, cache, inverse=inverse)
     finally:
         csa2._rope_fused_device_supported = original
 
@@ -2373,3 +2533,35 @@ def test_inverse_tolerance_breaks_at_scale16(monkeypatch: Any) -> None:
     _install_fused_stub(monkeypatch)
     ratio = _inverse_tolerance_ratio(monkeypatch, 16.0)
     assert ratio <= 1.0, f"scale=16 ratio={ratio:.3f} (expected to break the bound)"
+
+
+@pytest.mark.parametrize("async_graph_inputs", [False, True])
+def test_dsa_replay_inplace_refresh_requires_explicit_opt_in(
+    monkeypatch: pytest.MonkeyPatch, async_graph_inputs: bool
+) -> None:
+    backend = _inplace_make_backend()
+    backend.supports_draft_to_target_overlap = async_graph_inputs
+    assert not backend._builder.async_graph_refresh
+    capture_meta, replay_meta = _paired_metadata(seed=3)
+    persistent = backend._build_dsa_metadata_for_forward(capture_meta)
+    replay_meta.dsa_metadata = persistent
+    original = backend._build_dsa_metadata_for_forward
+    destinations = []
+
+    def build(metadata: Any, **kwargs: Any) -> Any:
+        destinations.append(kwargs.get("inplace_target"))
+        return original(metadata, **kwargs)
+
+    monkeypatch.setattr(backend, "_build_dsa_metadata_for_forward", build)
+    aliases: list[str] = []
+    original_assert = backend._assert_graph_tensor_alias
+
+    def assert_alias(persistent_tensor: Any, refreshed_tensor: Any, name: str) -> None:
+        aliases.append(name)
+        original_assert(persistent_tensor, refreshed_tensor, name)
+
+    monkeypatch.setattr(type(backend), "_assert_graph_tensor_alias", staticmethod(assert_alias))
+    backend.refresh_dsa_metadata_for_graph_replay(replay_meta)
+    assert len(destinations) == 1
+    assert (destinations[0] is persistent) is async_graph_inputs
+    assert bool(aliases) is async_graph_inputs

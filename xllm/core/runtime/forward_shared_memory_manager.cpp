@@ -2390,7 +2390,8 @@ inline void initialize_device_buffer_session(ReadContext& context,
                                              const uint64_t payload_size,
                                              const uint64_t tensor_arena_offset,
                                              Stream* stream,
-                                             bool materialize_device_buffer) {
+                                             bool materialize_device_buffer,
+                                             bool non_blocking_device_upload) {
   if (context.device_session == nullptr) {
     return;
   }
@@ -2454,7 +2455,7 @@ inline void initialize_device_buffer_session(ReadContext& context,
         safe_to(host_input_buffer, device_options, /*non_blocking=*/true);
   } else {
     forward_input.device_input_buffer =
-        safe_to(host_input_buffer, device_options);
+        safe_to(host_input_buffer, device_options, non_blocking_device_upload);
   }
 
   session.owner_buffer = forward_input.device_input_buffer;
@@ -2472,6 +2473,7 @@ inline void initialize_device_buffer_session(ReadContext& context,
   (void)tensor_arena_offset;
   (void)stream;
   (void)materialize_device_buffer;
+  (void)non_blocking_device_upload;
 #endif
 }
 
@@ -2495,7 +2497,8 @@ inline void deserialize_forward_input_payload(
     const torch::Device& device,
     Stream* stream,
     bool materialize_device_buffer = true,
-    bool stabilize_dit_host_tensors = false) {
+    bool stabilize_dit_host_tensors = false,
+    bool non_blocking_device_upload = false) {
   const char* payload_base = buffer;
   // Bound the payload before the first field: read_data() does not check.
   CHECK_GE(buffer_size, sizeof(RawInputLayoutHeader))
@@ -2533,7 +2536,8 @@ inline void deserialize_forward_input_payload(
                                    buffer_size,
                                    layout.tensor_arena_offset,
                                    stream,
-                                   materialize_device_buffer);
+                                   materialize_device_buffer,
+                                   non_blocking_device_upload);
 
   read_tensor_and_host(
       context, forward_input.token_ids, forward_input.token_ids_host, stream);
@@ -3399,7 +3403,8 @@ bool unpack_from_input_host_buffer(const ForwardInput& input,
                                    const torch::Device& device,
                                    torch::ScalarType dtype,
                                    ForwardInput& output,
-                                   bool materialize_device_buffer) {
+                                   bool materialize_device_buffer,
+                                   bool non_blocking_device_upload) {
   if (!input.input_host_buffer.defined() ||
       !input.input_host_buffer.device().is_cpu() ||
       input.input_host_buffer.numel() == 0) {
@@ -3416,7 +3421,9 @@ bool unpack_from_input_host_buffer(const ForwardInput& input,
       output,
       device,
       /*stream=*/nullptr,
-      materialize_device_buffer);
+      materialize_device_buffer,
+      /*stabilize_dit_host_tensors=*/false,
+      non_blocking_device_upload);
   auto normalize_float_param = [&](torch::Tensor& tensor) {
     if (tensor.defined() && tensor.scalar_type() != dtype) {
       tensor = tensor.to(torch::TensorOptions().device(device).dtype(dtype));
@@ -3442,6 +3449,19 @@ bool unpack_from_input_host_buffer(const ForwardInput& input,
   output.input_host_buffer_has_layout = false;
   output.device_tensors_ready = false;
   return true;
+}
+
+bool unpack_from_input_host_buffer(const ForwardInput& input,
+                                   const torch::Device& device,
+                                   torch::ScalarType dtype,
+                                   ForwardInput& output,
+                                   bool materialize_device_buffer) {
+  return unpack_from_input_host_buffer(input,
+                                       device,
+                                       dtype,
+                                       output,
+                                       materialize_device_buffer,
+                                       /*non_blocking_device_upload=*/false);
 }
 
 bool unpack_from_input_host_buffer(const ForwardInput& input,

@@ -551,6 +551,8 @@ def test_batchless_build_is_the_b4_empty_length_signature() -> None:
     # CPython 3.11: "max() arg is an empty sequence"; 3.12: "iterable argument is empty".
     with pytest.raises(ValueError, match="empty"):
         max(int(value) for value in dsa.seq_lens_q.tolist())
+
+
 def test_build_c4_pad_positions() -> None:
     """c4_pad_positions records next_pos-4 when (pos+1) % 4 == 0."""
     builder, _, _ = _make_builder()
@@ -738,3 +740,71 @@ def test_graph_rejects_block_table_larger_than_bucket_capacity() -> None:
             enable_graph=True,
             graph_block_table_capacity_cols=2,
         )
+
+
+@pytest.mark.parametrize("non_blocking", [False, True])
+def test_async_upload_retains_staging_until_copy_finishes(monkeypatch: pytest.MonkeyPatch, non_blocking: bool) -> None:
+    """Identically shaped fields must not overwrite an in-flight host copy."""
+    from types import SimpleNamespace
+
+    class Device:
+        type = "npu"
+
+    class Completion:
+        def __init__(self) -> None:
+            self.finished = False
+
+        def query(self) -> bool:
+            return self.finished
+
+        def record(self, stream: object) -> None:
+            assert stream is current_stream
+            self.finished = False
+
+    class Destination:
+        device = Device()
+
+        def __init__(self) -> None:
+            self.copies: list[tuple[torch.Tensor, bool]] = []
+
+        def copy_(self, source: torch.Tensor, *, non_blocking: bool) -> None:
+            self.copies.append((source, non_blocking))
+
+    current_stream = object()
+    monkeypatch.setattr(
+        torch,
+        "npu",
+        SimpleNamespace(Event=Completion, current_stream=lambda device: current_stream),
+        raising=False,
+    )
+    original_empty = torch.empty
+    allocations: list[torch.Tensor] = []
+
+    def allocate(*args: object, **kwargs: object) -> torch.Tensor:
+        assert kwargs.pop("pin_memory") is True
+        tensor = original_empty(*args, **kwargs)
+        allocations.append(tensor)
+        return tensor
+
+    monkeypatch.setattr(torch, "empty", allocate)
+    builder = DsaMetadataBuilder([], [], async_graph_refresh=True)
+    destination = Destination()
+    first = torch.arange(8, dtype=torch.int32).reshape(2, 4)[:, ::2]
+    second = first + 100
+    builder._copy_to_destination(destination, first, non_blocking=non_blocking)
+    builder._copy_to_destination(destination, second, non_blocking=non_blocking)
+    assert [flag for _, flag in destination.copies] == [non_blocking, non_blocking]
+    torch.testing.assert_close(destination.copies[0][0], first)
+    torch.testing.assert_close(destination.copies[1][0], second)
+    if not non_blocking:
+        assert not allocations
+        assert not builder._pinned_uploads
+        return
+    assert len(allocations) == 2
+    assert destination.copies[0][0].data_ptr() != destination.copies[1][0].data_ptr()
+    uploads = next(iter(builder._pinned_uploads.values()))
+    uploads[0][1].finished = True
+    builder._copy_to_destination(destination, second, non_blocking=True)
+    assert len(allocations) == 2
+    assert destination.copies[2][0] is destination.copies[0][0]
+    torch.testing.assert_close(destination.copies[2][0], second)

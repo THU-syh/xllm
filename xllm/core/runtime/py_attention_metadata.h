@@ -152,6 +152,10 @@ class PyAttentionMetadataView final {
   torch::Tensor linear_state_indices_;
   torch::Tensor linear_state_read_indices_;
   torch::Tensor num_accepted_tokens_;
+  // Keep the pinned host source alive while the asynchronous H2D copy is in
+  // flight. The copy stream is also registered with this tensor below so the
+  // allocator does not recycle its storage too early.
+  torch::Tensor engram_lookback_host_staging_;
   torch::Tensor engram_lookback_token_ids_;
   std::vector<int32_t> dp_execution_token_counts_;
   std::vector<int32_t> raw_dp_execution_token_counts_;

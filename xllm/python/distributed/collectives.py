@@ -54,6 +54,7 @@ _world_endpoint = None
 _symm_eligible = {}
 _symm_buffers = {}
 _world_initialized = False
+_dp_host_steps: dict[tuple[int, ...], int] = {}
 # Resolved MoE EP communicator names, keyed by device string. The group
 # topology is fixed at rendezvous and ``get_hccl_comm_name`` lazily builds the
 # communicator, so a per-layer/per-step probe must resolve at most once.
@@ -423,6 +424,28 @@ def dp_all_gather(
             group_name="dp",
         )
     return all_gather_variable(x, token_counts, rank, "dp")
+
+
+def dp_all_true(value: bool, device: torch.device | str, world_size: int) -> bool:
+    """Agree on a CPU condition through the existing rendezvous store."""
+    ranks = _group_ranks.get(("dp", str(torch.device(device))))
+    store = _stores.get(_world_endpoint)
+    if ranks is None or len(ranks) != world_size or _world_rank not in ranks or store is None:
+        raise RuntimeError(f"DP host agreement requires an initialized {world_size}-rank DP group for {device}")
+    step = _dp_host_steps.get(ranks, 0)
+    _dp_host_steps[ranks] = step + 1
+    prefix = f"xllm/python_collectives/dp_admission/{','.join(map(str, ranks))}/{step}"
+    keys = [f"{prefix}/{rank}" for rank in ranks]
+    store.set(f"{prefix}/{_world_rank}", b"1" if value else b"0")
+    decisions = store.multi_get(keys)
+    # The final reader retires this step only after every peer has copied all
+    # decisions. Step-specific keys allow faster peers to start the next one.
+    readers_key = f"{prefix}/readers"
+    if store.add(readers_key, 1) == world_size:
+        for key in keys:
+            store.delete_key(key)
+        store.delete_key(readers_key)
+    return all(decision == b"1" for decision in decisions)
 
 
 def moe_tp_all_reduce(x: torch.Tensor) -> None:
@@ -1019,5 +1042,6 @@ __all__ = [
     "reduce_scatter",
     "all_gather_variable",
     "dp_all_gather",
+    "dp_all_true",
     "gather_dp_execution_tokens",
 ]

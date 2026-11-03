@@ -31,7 +31,7 @@ attention kernel.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -359,6 +359,7 @@ class DsaAttentionBackend(AttentionBackend):
 
         self._kv_caches: list[LayerCache] = []
         self._metadata: AttentionMetadata | None = None
+        self._metadata_staging: dict[tuple[torch.device, torch.dtype, torch.Size], list[tuple[torch.Tensor, Any]]] = {}
 
     def _use_native_sas(self, use_prefill: bool) -> bool:
         return self.dspark_use_native_sas and self.dspark_block_size > 0 and not use_prefill
@@ -440,15 +441,21 @@ class DsaAttentionBackend(AttentionBackend):
     ) -> DsaMetadata:
         """Build one request's complete DSA metadata without publishing it.
 
-        ``inplace_target`` (candidate A) is the graph-captured ``DsaMetadata``
+        ``inplace_target`` is the graph-captured ``DsaMetadata``
         whose tensor buffers were baked into the ACL graph. When set, the
         value-derived fields are written straight into those buffers and the
         returned metadata aliases them; the caller's replay copy then
-        degenerates to a shape/alias assertion for them. ``None`` (the default
-        and the only value the replay path passes) keeps the historical build
-        byte-for-byte.
+        degenerates to a shape/alias assertion for them. ``None`` allocates
+        fresh storage for eager execution and graph capture.
         """
         multi_block_tables = list(metadata.multi_block_tables)
+        host_tables = getattr(metadata, "multi_block_tables_host", None)
+        if (
+            self.supports_draft_to_target_overlap
+            and bool(getattr(metadata, "dsa_graph_mode", False))
+            and host_tables is not None
+        ):
+            multi_block_tables = list(host_tables)
         # Speculative draft inputs inherit the target model's SWA/C4/C128
         # manager tables.  A draft model can register only the SWA group, so
         # keep the prefix consumed by this backend, matching the C++ model's
@@ -530,6 +537,14 @@ class DsaAttentionBackend(AttentionBackend):
         # entry; it must stay constant across replays of that entry or the
         # gathered row count would re-shape mid-graph.
         compressed_metadata.graph_token_capacity = int(getattr(metadata, "dsa_graph_token_capacity", 0) or 0)
+        if self.supports_draft_to_target_overlap and compressed_metadata.is_acl_graph and self.device.type == "npu":
+            # Upload host-built positions before the RoPE gathers. Otherwise
+            # their implicit blocking H2D waits for the pending draft graph.
+            self._move_metadata_to_device(
+                compressed_metadata,
+                tensor_fields=("c4_pad_positions", "c128_pad_positions"),
+                move_tables=False,
+            )
         self._populate_compressed_attention_rope(compressed_metadata, metadata)
         # Only build the per-ratio map when rotary caches were attached. The
         # C++ model returns early from build_dsa_rope_metadata when its rotary
@@ -615,20 +630,20 @@ class DsaAttentionBackend(AttentionBackend):
         fresh values into the graph-captured storage
         (:meth:`_copy_graph_dsa_metadata`).
 
-        Candidate A (the in-place refresh mechanism, driven by the
-        ``inplace_target`` parameter of
-        :meth:`_build_dsa_metadata_for_forward`): building straight into the
-        captured operands makes the copy below assert alias (no bytes moved)
-        for the fields the builder wrote in place, copying only the remaining
-        fresh fields. The replay path itself passes no ``inplace_target``; the
-        mechanism stays exposed to callers and pinned by its tests.
+        Build directly into the captured operands where their shapes match.
+        The copy below retains those aliases and copies only the remaining
+        fresh fields into their captured storage.
         """
         metadata = self._metadata if metadata is None else metadata
         if metadata is None or metadata.dsa_metadata is None:
             raise RuntimeError("ACL graph DSA metadata must be captured before replay")
         persistent = metadata.dsa_metadata
-        refreshed = self._build_dsa_metadata_for_forward(metadata)
-        self._copy_graph_dsa_metadata(persistent, refreshed)
+        refreshed = (
+            self._build_dsa_metadata_for_forward(metadata, inplace_target=persistent)
+            if self.supports_draft_to_target_overlap
+            else self._build_dsa_metadata_for_forward(metadata)
+        )
+        self._copy_graph_dsa_metadata(persistent, refreshed, refreshed.refresh_inplace_fields)
 
     @classmethod
     def _copy_graph_dsa_metadata(
@@ -1516,9 +1531,44 @@ class DsaAttentionBackend(AttentionBackend):
             cmp_ratio=4,
         )
 
-    def _move_metadata_to_device(self, compressed_metadata: DsaMetadata) -> None:
+    def _move_metadata_to_device(
+        self,
+        compressed_metadata: DsaMetadata,
+        *,
+        tensor_fields: tuple[str, ...] | None = None,
+        move_tables: bool = True,
+    ) -> None:
         """Mirror ``deepseek_v4_move_dsa_metadata_to_device`` for eager mode."""
-        tensor_fields = (
+        forward_moves: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+
+        def move(tensor: torch.Tensor) -> torch.Tensor:
+            previous = forward_moves.get(id(tensor)) if self.supports_draft_to_target_overlap else None
+            if previous is not None:
+                return previous[1]
+            if (
+                self.supports_draft_to_target_overlap
+                and bool(getattr(compressed_metadata, "is_acl_graph", False))
+                and tensor.device.type == "cpu"
+                and self.device.type == "npu"
+            ):
+                key = (self.device, tensor.dtype, tensor.shape)
+                uploads = self._metadata_staging.setdefault(key, [])
+                for staged, completed in uploads:
+                    if completed.query():
+                        break
+                else:
+                    staged = torch.empty(tensor.shape, dtype=tensor.dtype, device="cpu", pin_memory=True)
+                    completed = torch.npu.Event()
+                    uploads.append((staged, completed))
+                staged.copy_(tensor)
+                result = staged.to(self.device, non_blocking=True)
+                completed.record(torch.npu.current_stream(self.device))
+            else:
+                result = tensor.to(self.device)
+            forward_moves[id(tensor)] = (tensor, result)
+            return result
+
+        all_tensor_fields = (
             "seq_lens",
             "seq_lens_q",
             "actual_seq_lengths_query",
@@ -1540,19 +1590,20 @@ class DsaAttentionBackend(AttentionBackend):
             "c128_input_cos",
             "c128_input_sin",
         )
-        for name in tensor_fields:
+        for name in all_tensor_fields if tensor_fields is None else tensor_fields:
             tensor = getattr(compressed_metadata, name, None)
             if tensor is not None and tensor.device != self.device:
-                setattr(compressed_metadata, name, tensor.to(self.device))
+                setattr(compressed_metadata, name, move(tensor))
         # Skip the per-entry ``.to()`` dispatch when the entry already lives on
         # ``self.device`` (ACL-graph replay feeds device-resident stable tables,
         # and the in-place refresh must leave those captured buffers untouched);
         # eager builds from CPU-pinned scheduler tables still get a real move.
-        for per_layer_lists in (compressed_metadata.block_tables, compressed_metadata.slot_mappings):
-            for layer_tensors in per_layer_lists:
-                for index, tensor in enumerate(layer_tensors):
-                    if tensor.device != self.device:
-                        layer_tensors[index] = tensor.to(self.device)
+        if move_tables:
+            for per_layer_lists in (compressed_metadata.block_tables, compressed_metadata.slot_mappings):
+                for layer_tensors in per_layer_lists:
+                    for index, tensor in enumerate(layer_tensors):
+                        if tensor.device != self.device:
+                            layer_tensors[index] = move(tensor)
 
 
 # Keep the historical import stable.  There is one implementation and one

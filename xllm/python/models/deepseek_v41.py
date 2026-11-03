@@ -57,6 +57,9 @@ from __future__ import annotations
 import json
 import os
 import socket
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from dataclasses import dataclass, field, replace
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Optional, Sequence, Union
@@ -86,6 +89,7 @@ from xllm.python.model_executor.forward_context import (
     record_layer_event,
     wait_for_layer_load,
 )
+from xllm.python.model_executor.runners.base import GraphInputPreparation
 from xllm.python.model_loader.module_loaders import load_w8a8_dynamic_projection
 from xllm.python.models.aux_hidden_capture import AuxHiddenCapture
 from xllm.python.models.base import PyModelBase
@@ -2579,6 +2583,20 @@ class DeepseekV41DecoderLayer(nn.Module):
         return hidden, ffn_pre
 
 
+@dataclass
+class _EngramHashGraph:
+    """Hash workload and request storage retained for one target graph entry."""
+
+    metadata: Any
+    dsa_metadata: Any
+    input_ids: torch.Tensor
+    positions: torch.Tensor
+    graph: Any
+    hashes: torch.Tensor
+    gate_mask: torch.Tensor
+    ready_event: Any
+
+
 class DeepseekV41Model(nn.Module):
     """DeepSeek-V4.1 transformer body.
 
@@ -2602,6 +2620,12 @@ class DeepseekV41Model(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.quant_mode = quant_mode
+        self._engram_staging_executor: ThreadPoolExecutor | None = None
+        self._engram_staging_stream: Any = None
+        self._engram_hashes_host: torch.Tensor | None = None
+        self._engram_hash_graphs: dict[int, _EngramHashGraph] = {}
+        self._engram_hash_capture_stream: Any = None
+        self._engram_rows_ready: dict[int, Any] = {}
         self.csa2_plan = CSA2LayerPlan.build(
             cfg.n_layers,
             cfg.compress_ratios,
@@ -2762,7 +2786,15 @@ class DeepseekV41Model(nn.Module):
         if not self.engram_hash.ensure_cache(cache, cache.shape[1]):
             raise RuntimeError("Cannot restore Engram history before cache binding")
         pairs = torch.tensor(history, dtype=torch.int64).reshape(-1, 2)
-        self.engram_hash.restore_history(pairs)
+        if (
+            cache.device.type == "npu"
+            and bool(getattr(backend, "supports_draft_to_target_overlap", False))
+            and not bool(getattr(metadata, "is_prefill", False))
+            and not bool(getattr(metadata, "is_chunked_prefill", False))
+        ):
+            self.engram_hash.restore_history(pairs, non_blocking=True)
+        else:
+            self.engram_hash.restore_history(pairs)
 
     def _compute_engram_hashes(
         self,
@@ -2798,6 +2830,77 @@ class DeepseekV41Model(nn.Module):
             max_chunk_len=max_chunk_len,
         )
         return hashes, ~dead
+
+    def _replay_engram_hashes(
+        self,
+        metadata: Any,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        state = self._engram_hash_graphs[id(metadata)]
+        if (
+            state.metadata is not metadata
+            or state.dsa_metadata is not metadata.dsa_metadata
+            or state.input_ids.data_ptr() != input_ids.data_ptr()
+            or state.positions.data_ptr() != positions.data_ptr()
+        ):
+            raise RuntimeError("Engram hash graph inputs changed after capture")
+        state.graph.replay()
+        return state.hashes, state.gate_mask
+
+    def _capture_engram_hashes(
+        self,
+        backend: Any,
+        metadata: Any,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        if id(metadata) in self._engram_hash_graphs:
+            return self._replay_engram_hashes(metadata, input_ids, positions)
+        # Warm up on the first target capture, before asynchronous target input
+        # preparation starts. Later steps submit this hash workload with one API call.
+        caller_stream = torch.npu.current_stream(input_ids.device)
+        if self._engram_hash_capture_stream is None:
+            self._engram_hash_capture_stream = torch.npu.Stream(device=input_ids.device)
+        stream = self._engram_hash_capture_stream
+        stream.wait_stream(caller_stream)
+        with torch.npu.stream(stream):
+            hashes, gate_mask = self._compute_engram_hashes(backend, metadata, input_ids, positions)
+        if hashes is None:
+            return None, None
+        graph = torch.npu.NPUGraph()
+        try:
+            with torch.npu.graph(graph, stream=stream):
+                hashes, gate_mask = self._compute_engram_hashes(backend, metadata, input_ids, positions)
+            # External events allocate and initialize device storage lazily.
+            # Warm this event with the graph entry, outside steady-state decode.
+            ready_event = torch.npu.ExternalEvent()
+        except BaseException:
+            # Capture did not publish an entry; release its partial graph while
+            # preserving the failure. Do not retry from mutated hash history.
+            stream.synchronize()
+            graph.reset()
+            raise
+        caller_stream.wait_stream(stream)
+        assert hashes is not None and gate_mask is not None
+        self._engram_hash_graphs[id(metadata)] = _EngramHashGraph(
+            metadata, metadata.dsa_metadata, input_ids, positions, graph, hashes, gate_mask, ready_event
+        )
+        return self._replay_engram_hashes(metadata, input_ids, positions)
+
+    def release_graph_inputs(self, metadata: Any) -> None:
+        """Discard input graphs owned by an uncached target entry.
+
+        The runner drains target capture work before calling this rollback.
+        It never evicts a live target entry while its inputs are in use.
+        """
+        state = self._engram_hash_graphs.get(id(metadata))
+        if state is not None:
+            self._engram_hash_capture_stream.synchronize()
+            torch.npu.current_stream(state.input_ids.device).synchronize()
+            state.graph.reset()
+            del self._engram_hash_graphs[id(metadata)]
+        self._engram_rows_ready.pop(id(metadata), None)
 
     def _engram_shared_node_bytes(self, tp_size: int, replica_size: int, shard_size: int, quant_block: int = 32) -> int:
         """Estimate this node's shared host-table footprint (precheck only).
@@ -2874,6 +2977,30 @@ class DeepseekV41Model(nn.Module):
         cannot leak the rest; the collected failures are raised together at the
         end (the caller is the C++ destructor, which tolerates the raise).
         """
+        executor = getattr(self, "_engram_staging_executor", None)
+        if executor is not None:
+            executor.shutdown(wait=True)
+            self._engram_staging_executor = None
+        # Teardown only: finish producer copies and graph consumers before
+        # dropping graph-held buffers, external events or host staging storage.
+        graphs = getattr(self, "_engram_hash_graphs", {})
+        streams = [
+            getattr(self, "_engram_staging_stream", None),
+            getattr(self, "_engram_hash_capture_stream", None),
+        ]
+        if graphs:
+            state = next(iter(graphs.values()))
+            torch.npu.synchronize(state.input_ids.device)
+        for stream in streams:
+            if stream is not None:
+                stream.synchronize()
+        for state in graphs.values():
+            state.graph.reset()
+        graphs.clear()
+        getattr(self, "_engram_rows_ready", {}).clear()
+        self._engram_staging_stream = None
+        self._engram_hash_capture_stream = None
+        self._engram_hashes_host = None
         failures: list[str] = []
         for layer_id, layer in enumerate(self.layers):
             engram = getattr(layer, "engram", None)
@@ -3001,7 +3128,15 @@ class DeepseekV41Model(nn.Module):
         # None only in unit stubs, where there is nothing to build.
         if metadata is not None and getattr(metadata, "dsa_metadata", None) is None:
             self._build_dsa_metadata_for_forward(backend, metadata, positions)
-        hashes, _ = self._compute_engram_hashes(backend, metadata, input_ids, positions)
+        overlap_graph = (
+            bool(getattr(backend, "supports_draft_to_target_overlap", False))
+            and input_ids.device.type == "npu"
+            and bool(getattr(metadata, "dsa_graph_mode", False))
+        )
+        if overlap_graph:
+            hashes, _ = self._capture_engram_hashes(backend, metadata, input_ids, positions)
+        else:
+            hashes, _ = self._compute_engram_hashes(backend, metadata, input_ids, positions)
         if hashes is None:
             return False
         # ``engram_offload_active`` is True here (the guard above returned
@@ -3023,7 +3158,103 @@ class DeepseekV41Model(nn.Module):
             [ids for _, ids in pairs],
             graph_visible=True,
         )
+        if overlap_graph:
+            event = self._engram_rows_ready.get(id(metadata))
+            if event is None:
+                event = torch.npu.ExternalEvent()
+                self._engram_rows_ready[id(metadata)] = event
+            event.record(torch.npu.current_stream(input_ids.device))
+            self._engram_hash_graphs[id(metadata)].ready_event.record(torch.npu.current_stream(input_ids.device))
         return True
+
+    def stage_engram_rows_outside_graph_async(
+        self,
+        backend: Any,
+        metadata: Any,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        *,
+        prepare_metadata: Callable[[], None],
+        prepare_history: Callable[[], None] | None = None,
+    ) -> GraphInputPreparation | None:
+        """Submit target replay while the preceding draft feeds host staging."""
+        if not self.engram_offload_active or self.engram_hash is None or input_ids.device.type != "npu":
+            return None
+        engrams = [layer.engram for layer in self.layers if getattr(layer, "engram", None) is not None]
+        device = input_ids.device
+        caller_stream = torch.npu.current_stream(device)
+        ready = self._engram_hash_graphs[id(metadata)].ready_event
+        # The caller stream follows the previous graph consumer. Reset there
+        # before publishing inputs_ready, so neither the producer's new record
+        # nor the target's wait can observe the preceding replay's ready flag.
+        ready.reset(caller_stream)
+        inputs_ready = caller_stream.record_event()
+        rows_ready = self._engram_rows_ready[id(metadata)]
+        if self._engram_staging_executor is None:
+            self._engram_staging_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="engram-staging")
+            self._engram_staging_stream = torch.npu.Stream(device=device)
+
+        def finish() -> None:
+            with (
+                torch.inference_mode(),
+                torch.npu.device(device),
+                torch.npu.stream(self._engram_staging_stream),
+            ):
+                metadata_ready = False
+                try:
+                    # Input writes precede this event, including writes queued
+                    # behind the preceding draft. Keep metadata and hash
+                    # preparation off the replay submission thread.
+                    inputs_ready.wait(self._engram_staging_stream)
+                    # The preceding draft is ordered after the previous target,
+                    # so its input event also protects the captured consumer
+                    # wait before this persistent event is reset for reuse.
+                    rows_ready.reset(self._engram_staging_stream)
+                    prepare_metadata()
+                    # The target prefix needs only token/position and DSA.
+                    # Its first Engram consumer has a separate captured wait.
+                    ready.record(self._engram_staging_stream)
+                    metadata_ready = True
+                    # History affects Engram hashes, while the target prefix
+                    # can start as soon as its input and DSA metadata are ready.
+                    if prepare_history is not None:
+                        prepare_history()
+                    hashes, _ = self._replay_engram_hashes(metadata, input_ids, positions)
+                    if hashes is None:
+                        raise RuntimeError("Engram hash metadata is missing for target graph replay")
+                    # Copy the shared integer hashes once. Ownership and local
+                    # row arithmetic can run on the CPU that performs lookup,
+                    # avoiding two D2H copies and several device launches per
+                    # layer on the draft-to-target dependency chain.
+                    if self._engram_hashes_host is None or self._engram_hashes_host.shape != hashes.shape:
+                        self._engram_hashes_host = torch.empty_like(hashes, device="cpu", pin_memory=True)
+                    host_hashes = self._engram_hashes_host
+                    host_hashes.copy_(hashes, non_blocking=True)
+                    copied = self._engram_staging_stream.record_event()
+                    # Wait only for the queued hash-ID copies. The target has
+                    # already been submitted with an external readiness wait;
+                    # a whole-device synchronize here would wait on itself.
+                    copied.synchronize()
+                    for engram in engrams:
+                        engram.begin_stage_offload(
+                            host_hashes[:, engram.layer_hash_index].to(torch.int64), graph_visible=True
+                        )
+                        engram.finish_stage_offload(graph_visible=True)
+                finally:
+                    # Release the device wait even when lookup fails. The
+                    # runner joins this future before returning any output and
+                    # propagates that failure to the model execution boundary.
+                    rows_ready.record(self._engram_staging_stream)
+                    if not metadata_ready:
+                        ready.record(self._engram_staging_stream)
+
+        # Hash-cache updates use the forward context to preserve the graph
+        # path's duplicate-slot semantics in this worker thread.
+        context = copy_context()
+        # The target captures its metadata wait once, just like its Engram-row
+        # wait. Reissuing a Python wait before the next producer record is not
+        # supported by value-backed ExternalEvent's host-side bookkeeping.
+        return GraphInputPreparation(None, self._engram_staging_executor.submit(context.run, finish))
 
     def forward(
         self,
@@ -3035,20 +3266,26 @@ class DeepseekV41Model(nn.Module):
             raise NotImplementedError(
                 "DeepSeek-V4.1 context parallelism is scheduled with the Phase-6 distributed work"
             )
+        context = get_forward_context()
+        backend = context.attention_backend
+        metadata = context.metadata
+        draft_to_target_overlap = bool(getattr(backend, "supports_draft_to_target_overlap", False))
+        if draft_to_target_overlap and self.engram_offload_active and capturing_acl_graph():
+            self._engram_hash_graphs[id(metadata)].ready_event.wait(torch.npu.current_stream(input_ids.device))
         if inputs_embeds is not None:
             hidden = inputs_embeds
         else:
             hidden = self.embed_tokens(input_ids)
         positions = positions.to(torch.int64).contiguous()
-        context = get_forward_context()
-        backend = context.attention_backend
-        metadata = context.metadata
         graph_mode = bool(getattr(metadata, "dsa_graph_mode", False))
         if graph_mode and getattr(metadata, "dsa_metadata", None) is not None:
             # ACL graph replay reuses the metadata captured during warmup.
             pass
         else:
             self._build_dsa_metadata_for_forward(backend, metadata, positions)
+
+        if draft_to_target_overlap and graph_mode:
+            backend.prepare_graph_forward(metadata)
 
         # Engram: compute the n-gram hashes once, on the full token stream,
         # before the layer loop; each engram layer then pre-gathers its rows.
@@ -3108,6 +3345,14 @@ class DeepseekV41Model(nn.Module):
         aux_capture = self.aux_hidden_capture
         aux_hidden_buffer = aux_capture.create_buffer(hidden.mean(dim=1)) if aux_capture.enabled else None
         for layer_id, layer in enumerate(self.layers):
+            if (
+                draft_to_target_overlap
+                and self.engram_offload_active
+                and layer.engram is not None
+                and layer_id == self.cfg.engram_layer_ids[0]
+                and capturing_acl_graph()
+            ):
+                self._engram_rows_ready[id(metadata)].wait(torch.npu.current_stream(input_ids.device))
             if layer_id == SWA_BOUNDED_FIRST_CONSUMER and should_run_swa_bounded_replay(
                 self.cfg.enable_swa_bounded_replay, context
             ):
@@ -3616,6 +3861,9 @@ class DeepseekV41ForCausalLM(PyModelBase):
         # ``_load_engram_ascend``) demotes the whole model to the HBM path so the
         # ACL-graph capture never mixes offloaded and device engram layers.
         self.model._reconcile_engram_offload_active()
+
+    def release_graph_inputs(self, metadata: Any) -> None:
+        self.model.release_graph_inputs(metadata)
 
     def close_host_offload(self) -> None:
         """Release DP-shared host tables before this model is dropped.

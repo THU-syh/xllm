@@ -155,6 +155,7 @@ def _clear_collective_state():
         collectives._groups.clear()
         collectives._group_ranks.clear()
         collectives._stores.clear()
+        collectives._dp_host_steps.clear()
         collectives._symm_eligible.clear()
         collectives._symm_buffers.clear()
         collectives._moe_ep_comm_name_cache.clear()
@@ -228,12 +229,21 @@ def test_tp_group_requires_initialized_group() -> None:
 
 @pytest.mark.parametrize("global_rank,root_rank", [(0, 0), (1, 0), (2, 2), (3, 2)])
 def test_tp_broadcast_stays_within_each_dp_replica(
-    monkeypatch: pytest.MonkeyPatch, global_rank: int, root_rank: int,
+    monkeypatch: pytest.MonkeyPatch,
+    global_rank: int,
+    root_rank: int,
 ) -> None:
     _mock_process_groups(monkeypatch, global_rank=global_rank)
     monkeypatch.setattr(collectives, "_backend_for", lambda device: "gloo")
     group = collectives.init_tp_group(
-        "host", 1234, global_rank % 2, 2, "cpu", global_rank, 4, global_rank // 2,
+        "host",
+        1234,
+        global_rank % 2,
+        2,
+        "cpu",
+        global_rank,
+        4,
+        global_rank // 2,
     )
     native_op = MagicMock(side_effect=AssertionError("Broadcast must use the Python group"))
     monkeypatch.setattr(collectives, "_native_runtime_op", native_op)
@@ -247,6 +257,58 @@ def test_tp_broadcast_stays_within_each_dp_replica(
     assert collectives._group_ranks[("tp", "cpu")] == (root_rank, root_rank + 1)
     broadcast.assert_called_once_with(tokens, src=root_rank, group=group)
     native_op.assert_not_called()
+
+
+@pytest.mark.parametrize("allowed", (False, True))
+def test_dp_all_true_reuses_host_store_and_retires_step(
+    monkeypatch: pytest.MonkeyPatch,
+    allowed: bool,
+) -> None:
+    store = MagicMock()
+    store.multi_get.return_value = [b"1", b"1" if allowed else b"0"]
+    store.add.return_value = 2
+    collectives._group_ranks[("dp", "npu:0")] = (1, 3)
+    collectives._stores[("host", 1234)] = store
+    monkeypatch.setattr(collectives, "_world_endpoint", ("host", 1234))
+    monkeypatch.setattr(collectives, "_world_rank", 1)
+    create_group = MagicMock(side_effect=AssertionError("unexpected process group creation"))
+    monkeypatch.setattr(dist, "new_group", create_group)
+
+    for step in range(2):
+        assert collectives.dp_all_true(True, "npu:0", 2) == allowed
+        prefix = f"xllm/python_collectives/dp_admission/1,3/{step}"
+        store.set.assert_called_with(f"{prefix}/1", b"1")
+        store.multi_get.assert_called_with([f"{prefix}/1", f"{prefix}/3"])
+        store.add.assert_called_with(f"{prefix}/readers", 1)
+        assert store.delete_key.call_count == 3 * (step + 1)
+    create_group.assert_not_called()
+
+
+def test_dp_all_true_requires_complete_dp_membership() -> None:
+    with pytest.raises(RuntimeError, match="initialized 2-rank DP group"):
+        collectives.dp_all_true(True, "cpu", 2)
+
+
+def _run_dp_host_agreement(global_rank: int, port: int) -> None:
+    endpoint = ("127.0.0.1", port)
+    store = dist.TCPStore(*endpoint, None, False, timedelta(seconds=20))
+    collectives._stores[endpoint] = store
+    collectives._world_endpoint = endpoint
+    collectives._world_rank = global_rank
+    collectives._group_ranks[("dp", "cpu")] = (global_rank % 2, global_rank % 2 + 2)
+    for step in range(20):
+        local_allowed = global_rank != 2 or step % 2 == 0
+        expected = global_rank % 2 == 1 or step % 2 == 0
+        assert collectives.dp_all_true(local_allowed, "cpu", 2) == expected
+        if global_rank == 0:
+            time.sleep(0.001)
+
+
+def test_dp_host_agreement_across_processes() -> None:
+    store = dist.TCPStore("127.0.0.1", 0, None, True, timedelta(seconds=20))
+    initial_keys = store.num_keys()
+    torch.multiprocessing.start_processes(_run_dp_host_agreement, args=(store.port,), nprocs=4, start_method="fork")
+    assert store.num_keys() == initial_keys
 
 
 def test_tp_group_does_not_reuse_dp_group() -> None:

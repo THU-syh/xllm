@@ -84,6 +84,15 @@ bool unpack_from_input_host_buffer(const ForwardInput& input,
                                    ForwardInput& output,
                                    bool materialize_device_buffer);
 
+// The caller must retain any pinned input buffer until the asynchronous
+// device upload has completed.
+bool unpack_from_input_host_buffer(const ForwardInput& input,
+                                   const torch::Device& device,
+                                   torch::ScalarType dtype,
+                                   ForwardInput& output,
+                                   bool materialize_device_buffer,
+                                   bool non_blocking_device_upload);
+
 bool unpack_from_input_host_buffer(const ForwardInput& input,
                                    const torch::Device& device,
                                    ForwardInput& output);

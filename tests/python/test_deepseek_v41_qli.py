@@ -1693,3 +1693,25 @@ def test_qli_v3_prefill_leaves_decode_graph_steps_on_the_decode_path(
     assert recorder.metadata_calls[0][1]["max_seqlen_q"] == 1
     assert recorder.metadata_calls[0][1]["max_seqlen_k"] == _CAPACITY
     assert recorder.indexer_calls[0]["cu_seqlens_q"].tolist() == [0, 1, 2, 3, 4]
+
+
+def test_qli_refresh_runs_inside_target_after_warmup(monkeypatch: pytest.MonkeyPatch) -> None:
+    _stub_qli(monkeypatch)
+    backend = _make_backend()
+    dsa = _make_dsa()
+    state = backend._qli_state_for(dsa)
+    metadata = SimpleNamespace(dsa_metadata=dsa)
+    monkeypatch.setattr(csa2.DsaAttentionBackend, "refresh_dsa_metadata_for_graph_replay", lambda *_: None)
+    addresses = {ratio: value.data_ptr() for ratio, value in state.seqused_k.items()}
+    backend.prepare_graph_forward(metadata)
+    assert dsa.qli_refresh_in_target_graph
+    for values in ([0, 0, 0, 0], [127, 128, 8193, 8194]):
+        previous = state.seqused_k[2].clone()
+        dsa.seq_lens.copy_(torch.tensor(values, dtype=torch.int32))
+        backend.refresh_dsa_metadata_for_graph_replay(metadata)
+        assert torch.equal(state.seqused_k[2], previous)
+        backend.prepare_graph_forward(metadata)
+        for ratio, value in state.seqused_k.items():
+            assert value.data_ptr() == addresses[ratio]
+            assert torch.equal(value, dsa.seq_lens // ratio)
+            assert torch.equal(state.cmp_residual[ratio], dsa.seq_lens % ratio)

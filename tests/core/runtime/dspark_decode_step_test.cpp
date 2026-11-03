@@ -145,6 +145,19 @@ class DSparkWorkerImplTestPeer final {
     return worker.draft_prelaunch_enabled_for_init_;
   }
 
+  static void finish_empty_decode(DSparkWorkerImpl& worker,
+                                  ForwardOutput& output,
+                                  std::optional<ForwardOutput>& draft_output,
+                                  bool warmup = false) {
+    ForwardInput input;
+    input.input_params.meta.is_graph_warmup = warmup;
+    worker.finish_empty_decode(input, output, draft_output);
+  }
+
+  static size_t idle_input_count(const DSparkWorkerImpl& worker) {
+    return worker.idle_decode_output_.retained_inputs.size();
+  }
+
   static bool can_prepare_without_wait(const DSparkWorkerImpl& worker,
                                        const ForwardInput& input) {
     return worker.can_prepare_without_compute_stream_wait(input);
@@ -415,6 +428,69 @@ INSTANTIATE_TEST_SUITE_P(CacheLayouts,
                                            std::make_tuple(4, true),
                                            std::make_tuple(128, false),
                                            std::make_tuple(128, true)));
+
+TEST(DSparkDecodeStepTest, IdleDecodeRetainsInputsUntilNextSubmission) {
+  Device device(0);
+  device.set_device();
+  device.init_device_context();
+  const ParallelArgs parallel_args(0, 1, nullptr);
+  runtime::Options options;
+  options.enable_schedule_overlap(true).num_speculative_tokens(5);
+  std::weak_ptr<ForwardInput> final_input;
+  {
+    DSparkWorkerImpl worker(parallel_args, device.unwrap(), options);
+    DSparkWorkerImplTestPeer::initialize_decode_modes(worker, true);
+    auto target_input = std::make_shared<ForwardInput>();
+    auto draft_input = std::make_shared<ForwardInput>();
+    std::weak_ptr<ForwardInput> first_target = target_input;
+    std::weak_ptr<ForwardInput> first_draft = draft_input;
+    ForwardOutput output;
+    output.retained_inputs.emplace_back(std::move(target_input));
+    std::optional<ForwardOutput> draft_output = ForwardOutput();
+    draft_output->retained_inputs.emplace_back(std::move(draft_input));
+    DSparkWorkerImplTestPeer::finish_empty_decode(worker, output, draft_output);
+    EXPECT_EQ(output.ready_event, nullptr);
+    EXPECT_TRUE(output.retained_inputs.empty());
+    EXPECT_TRUE(draft_output->retained_inputs.empty());
+    EXPECT_FALSE(first_target.expired());
+    EXPECT_FALSE(first_draft.expired());
+    EXPECT_EQ(DSparkWorkerImplTestPeer::idle_input_count(worker), 2);
+
+    auto next_input = std::make_shared<ForwardInput>();
+    final_input = next_input;
+    ForwardOutput next_output;
+    next_output.retained_inputs.emplace_back(std::move(next_input));
+    draft_output.reset();
+    DSparkWorkerImplTestPeer::finish_empty_decode(
+        worker, next_output, draft_output);
+    EXPECT_TRUE(first_target.expired());
+    EXPECT_TRUE(first_draft.expired());
+    EXPECT_FALSE(final_input.expired());
+    EXPECT_EQ(DSparkWorkerImplTestPeer::idle_input_count(worker), 1);
+  }
+  EXPECT_TRUE(final_input.expired());
+}
+
+TEST(DSparkDecodeStepTest, IdleDecodeKeepsSynchronousFallback) {
+  Device device(0);
+  device.set_device();
+  device.init_device_context();
+  const ParallelArgs parallel_args(0, 1, nullptr);
+  runtime::Options options;
+  options.enable_schedule_overlap(true).num_speculative_tokens(5);
+  for (const bool warmup : {false, true}) {
+    DSparkWorkerImpl worker(parallel_args, device.unwrap(), options);
+    DSparkWorkerImplTestPeer::initialize_decode_modes(worker, warmup);
+    ForwardOutput output;
+    output.retained_inputs.emplace_back(std::make_shared<ForwardInput>());
+    std::optional<ForwardOutput> draft_output = ForwardOutput();
+    DSparkWorkerImplTestPeer::finish_empty_decode(
+        worker, output, draft_output, warmup);
+    EXPECT_EQ(output.ready_event, nullptr);
+    EXPECT_EQ(output.retained_inputs.size(), 1);
+    EXPECT_EQ(DSparkWorkerImplTestPeer::idle_input_count(worker), 0);
+  }
+}
 
 TEST(DSparkDecodeStepTest, AsyncOutputDoesNotRequireDraftPrelaunch) {
   Device device(0);

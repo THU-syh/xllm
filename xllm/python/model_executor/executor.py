@@ -670,7 +670,9 @@ class ModelExecutor:
                 metadata,
                 input_embedding,
             )
-            if restore_history is not None:
+            # Only the overlap runner restores history with its deferred
+            # input preparation. Other graph paths retain executor ownership.
+            if restore_history is not None and not getattr(graph_runner, "supports_draft_to_target_overlap", False):
                 restore_history(self.attention_backend, metadata)
             output = graph_runner.execute(
                 input_ids,

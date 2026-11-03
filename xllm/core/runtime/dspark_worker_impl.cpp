@@ -44,6 +44,9 @@ DSparkWorkerImpl::DSparkWorkerImpl(const ParallelArgs& parallel_args,
                                   : parallel_args.process_group_) {}
 
 DSparkWorkerImpl::~DSparkWorkerImpl() {
+  if (idle_decode_output_.ready_event != nullptr) {
+    CHECK(idle_decode_output_.ready_event->synchronize());
+  }
   if (pending_context_.has_value()) {
     CHECK(pending_context_->context_ready->synchronize());
   }
@@ -565,6 +568,33 @@ std::optional<ForwardOutput> DSparkWorkerImpl::step_empty(
   force_greedy_draft_sampling(sampling.parameters);
   empty_input.input_params.sampling = std::move(sampling);
   return DFlashWorkerImpl::step_empty(empty_input);
+}
+
+void DSparkWorkerImpl::finish_empty_decode(
+    const ForwardInput& input,
+    ForwardOutput& output,
+    std::optional<ForwardOutput>& draft_output) {
+  if (!draft_prelaunch_enabled_for_init_ ||
+      input.input_params.meta.is_graph_warmup) {
+    DFlashWorkerImpl::finish_empty_decode(input, output, draft_output);
+    return;
+  }
+  StreamEventPtr ready = compute_stream_->record_event();
+  CHECK(ready != nullptr);
+  // The next draft must reach DP graph admission while the current target is
+  // running, including on idle ranks. Retire the previous idle inputs only
+  // after this step's draft and target have both been submitted.
+  if (idle_decode_output_.ready_event != nullptr) {
+    CHECK(idle_decode_output_.ready_event->synchronize());
+  }
+  idle_decode_output_.ready_event = std::move(ready);
+  idle_decode_output_.retained_inputs = take_retained_inputs(output);
+  output.ready_event.reset();
+  if (draft_output.has_value()) {
+    transfer_retained_inputs(idle_decode_output_, draft_output.value());
+  }
+  // This worker owns retirement. The empty output carries no token that the
+  // generic scheduler must wait to read, and no input it must keep alive.
 }
 
 DSparkWorkerImpl::BlockSample DSparkWorkerImpl::sample_block(

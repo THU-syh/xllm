@@ -60,6 +60,9 @@ class DSparkWorkerImpl final : public DFlashWorkerImpl {
                                       ForwardOutput& target_output) override;
   std::optional<ForwardOutput> step_prefill(const ForwardInput& input) override;
   std::optional<ForwardOutput> step_empty(const ForwardInput& input) override;
+  void finish_empty_decode(const ForwardInput& input,
+                           ForwardOutput& output,
+                           std::optional<ForwardOutput>& draft_output) override;
   bool can_prepare_without_compute_stream_wait(
       const ForwardInput& input) const override;
 
@@ -91,6 +94,8 @@ class DSparkWorkerImpl final : public DFlashWorkerImpl {
   bool async_output_enabled_ = false;
   bool draft_prelaunch_enabled_for_init_ = false;
   std::optional<PendingContext> pending_context_;
+  // One idle step's inputs; retired only after the following step is queued.
+  ForwardOutput idle_decode_output_;
   torch::Tensor prepared_base_positions_;
   dflash_async::DraftCacheBlockTable prepared_context_block_table_;
   StreamEventPtr prepared_context_ready_;

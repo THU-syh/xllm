@@ -49,6 +49,7 @@ def test_pd_history_is_restored_before_execution(runner_kind: str) -> None:
     executor.decode_graph_runner = None
     executor.inductor_runner = None
     runner = MagicMock()
+    runner.supports_draft_to_target_overlap = False
 
     def execute(*_args: object, **_kwargs: object) -> torch.Tensor:
         assert events[-1] == "restore"

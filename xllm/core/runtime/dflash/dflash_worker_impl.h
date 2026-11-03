@@ -95,6 +95,12 @@ class DFlashWorkerImpl : public DraftModelSpecWorkerImpl {
 
   std::optional<ForwardOutput> step_empty(const ForwardInput& input) override;
 
+  // The default idle path retires both forwards before returning. A subclass
+  // that defers this wait must retain their inputs until the target is ready.
+  virtual void finish_empty_decode(const ForwardInput& input,
+                                   ForwardOutput& output,
+                                   std::optional<ForwardOutput>& draft_output);
+
   // Draft produces all speculative tokens of a block in one forward, so its
   // output is a single [batch, num_speculative_tokens] block rather than the
   // per-step outputs an autoregressive drafter (e.g. MTP) yields.

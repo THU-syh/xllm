@@ -476,13 +476,24 @@ class EngramHashState(nn.Module):
     def restore_history(
         self,
         history: torch.Tensor,
+        *,
+        non_blocking: bool = False,
     ) -> None:
         """Seed prompt-tail [receiver-local slot, token] pairs before decode."""
         if self._cache is None:
             raise RuntimeError("Engram history restore requires a bound cache")
         if history.ndim != 2 or history.shape[1] != 2:
             raise ValueError("Engram history must contain [slot, token] pairs")
-        history = history.to(device=self._cache.device, dtype=torch.int64)
+        deduplicate = not in_acl_graph()
+        if non_blocking and history.device.type == "cpu" and self._cache.device.type == "npu":
+            # Resolve duplicate receiver slots while the history is still on
+            # the host. Device boolean indexing would synchronize the draft
+            # even after an asynchronous upload of these fixed history rows.
+            slots, tokens = last_ring_writes(history[:, 0], history[:, 1])
+            history = torch.stack((slots, tokens), dim=1).to(torch.int64)
+            history = history.pin_memory(device=self._cache.device.type)
+            deduplicate = False
+        history = history.to(device=self._cache.device, dtype=torch.int64, non_blocking=non_blocking)
         slots, tokens = history.unbind(dim=1)
         comp = self.token_map[tokens.clamp(0, self.token_map.numel() - 1)]
         comp = torch.where(
@@ -493,7 +504,7 @@ class EngramHashState(nn.Module):
         self._write_hash_cache(
             comp,
             slots,
-            deduplicate=not in_acl_graph(),
+            deduplicate=deduplicate,
         )
 
     def forward(

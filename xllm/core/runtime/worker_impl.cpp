@@ -24,6 +24,7 @@ limitations under the License.
 
 #include <algorithm>
 
+#include "core/runtime/forward_shared_memory_manager.h"
 #include "core/runtime/json_object_output_rows.h"
 #if defined(USE_NPU)
 #include "acl/acl.h"
@@ -1328,18 +1329,48 @@ void WorkerImpl::prepare_work_before_execute_on_stream(
   }
 #endif
   c10::StreamGuard stream_guard = prepare_stream.set_stream_guard();
+  CHECK(prepare_stream.wait_event(input.metadata_ready_event))
+      << "failed to wait input metadata ready event on worker prepare stream";
+
+#if defined(USE_NPU)
+  const bool upload_packed_input =
+      !input.device_tensors_ready && input.input_host_buffer_has_layout &&
+      ::xllm::ExecutionConfig::get_instance().use_contiguous_input_buffer();
+  if (upload_packed_input) {
+    // Each unpack owns fresh pinned staging and device storage. Upload it once
+    // before inspecting the decoded host fields; no previous compute consumer
+    // uses these new buffers. Shared-state updates below retain their wait.
+    CHECK(detail::unpack_from_input_host_buffer(
+        input,
+        device_,
+        dtype_,
+        processed_input,
+        /*materialize_device_buffer=*/true,
+        /*non_blocking_device_upload=*/true));
+    CHECK(processed_input.device_tensors_ready);
+  }
+  const ForwardInput& preparation_input =
+      upload_packed_input ? processed_input : input;
+#else
+  const ForwardInput& preparation_input = input;
+#endif
   if (wait_for_compute && enable_schedule_overlap() &&
-      !can_prepare_without_compute_stream_wait(input) && compute_stream_) {
+      !can_prepare_without_compute_stream_wait(preparation_input) &&
+      compute_stream_) {
     // MTP updates reuse shared prepare/compute streams and need this ordering;
     // graph double buffering or an explicitly enabled speculative prelaunch
     // path must provide independent input buffers before skipping this wait.
     prepare_stream.wait_stream(*compute_stream_);
   }
-  CHECK(prepare_stream.wait_event(input.metadata_ready_event))
-      << "failed to wait input metadata ready event on worker prepare stream";
 
   auto prepare_device_on_stream = [&]() {
+#if defined(USE_NPU)
+    if (!upload_packed_input) {
+      processed_input = input.to(device_, dtype_);
+    }
+#else
     processed_input = input.to(device_, dtype_);
+#endif
     // Packed RPC/SHM inputs deserialize JSON snapshots inside ForwardInput::to.
     // Restore them before speculative dispatch so MTP sees the grammar rows.
     if (processed_input.json_object_states.empty() &&

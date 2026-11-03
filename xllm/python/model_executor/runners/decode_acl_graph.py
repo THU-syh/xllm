@@ -60,7 +60,11 @@ from xllm.python.model_executor.forward_context import (
     forward_context,
 )
 from xllm.python.model_executor.input_batch import InputBatch
-from xllm.python.model_executor.runners.base import BaseRunner, ModelExecutionOutput
+from xllm.python.model_executor.runners.base import (
+    BaseRunner,
+    GraphInputPreparation,
+    ModelExecutionOutput,
+)
 from xllm.python.model_executor.runners.decode_cuda_graph import (
     _CAPTURE_WARMUP_STEPS,
     _decode_bucket,
@@ -174,6 +178,9 @@ class _StaticAttentionMetadata:
     dp_execution_token_counts: tuple[int, ...] = ()
     dp_is_decode: tuple[int, ...] = ()
     q_seq_lens: torch.Tensor | None = None
+    # Query groups are fixed by the graph bucket. DSA must read this host
+    # copy instead of synchronizing the preceding draft to fetch the tensor.
+    q_seq_lens_host_values: list[int] | None = None
     kpool_query_lens: tuple[int, ...] = ()
     kpool_query_lens_device: torch.Tensor | None = None
     # Host-side copy of the (per-entry constant) q_cu for prepare()'s
@@ -197,6 +204,7 @@ class _StaticAttentionMetadata:
     kv_split_rank: int = 0
     has_kv_shard: bool = False
     multi_block_tables: Sequence[torch.Tensor | None] = ()
+    multi_block_tables_host: tuple[torch.Tensor, ...] | None = None
     dsa_metadata: object | None = None
     dsa_positions: torch.Tensor | None = None
     dsa_cos_sin: torch.Tensor | None = None
@@ -292,6 +300,9 @@ class DecodeAclGraphRunner(BaseRunner):
         eplv2_graph_token_limit: int | None = None,
     ) -> None:
         super().__init__(model, attention_backend, device)
+        self.supports_draft_to_target_overlap = bool(
+            getattr(attention_backend, "supports_draft_to_target_overlap", False)
+        )
         self.dp_size = dp_size
         self.dp_rank = dp_rank
         # Each rank may receive every sequence in the batch. The scheduler's
@@ -319,6 +330,7 @@ class DecodeAclGraphRunner(BaseRunner):
         self._stream: torch.npu.Stream | None = None
         self._update_stream: torch.npu.Stream | None = None
         self._replay_done_event: torch.npu.Event | None = None
+        self._pending_graph_preparations: list[tuple[GraphInputPreparation, Any]] = []
         # One-shot latch for the "host-offload staging staged nothing" warning
         # (see ``_warn_engram_stage_incomplete``): a replay runs once per step,
         # so an unlatched warning would flood the log for a persistent failure.
@@ -506,11 +518,9 @@ class DecodeAclGraphRunner(BaseRunner):
         )
         if self.dp_size == 1:
             return can_execute
-        vote = torch.tensor([int(can_execute)], dtype=torch.int32, device=self.device)
-        votes = distributed.dp_all_gather(vote, [1] * self.dp_size, self.dp_rank)
-        if votes.shape != (self.dp_size,):
-            raise RuntimeError(f"DP graph admission requires {self.dp_size} votes, got {tuple(votes.shape)}")
-        return bool(votes.all().item())
+        # The decision is CPU metadata. Keep DP agreement off the device stream
+        # so a preceding target cannot block early draft submission.
+        return distributed.dp_all_true(can_execute, self.device, self.dp_size)
 
     def _normalize_dsa_metadata(
         self,
@@ -1475,6 +1485,13 @@ class DecodeAclGraphRunner(BaseRunner):
         input_batch: InputBatch | None = None,
     ) -> ModelExecutionOutput:
         metadata = self._normalize_dsa_metadata(metadata)
+        # Keep event wrappers alive until the H2D-ready event has signalled;
+        # an ACL stream wait may still reference its native handle meanwhile.
+        self._pending_graph_preparations = [
+            (preparation, replay_done_event)
+            for preparation, replay_done_event in self._pending_graph_preparations
+            if not replay_done_event.query()
+        ]
         batch_size = input_ids.shape[0]
         # Same seq-vs-token admission as can_execute: MTP verify packs
         # (num_spec+1) token-rows per seq, so the capacity gate (max_batch, in
@@ -1586,18 +1603,23 @@ class DecodeAclGraphRunner(BaseRunner):
             # Both KDA checkpoint tables and model-specific metadata builders
             # must see padding slots before any warmup forward can run.
             capture_metadata = _CaptureAttentionMetadata(metadata)
-        self._fill_entry(
-            entry,
-            input_ids,
-            positions,
-            capture_metadata if capture_metadata is not None else metadata,
-            batch_size,
-            input_embedding,
-            input_batch,
-            verify_width=verify_width,
-            kpool_query_lens=kpool_query_lens,
-            local_expanded=expanded_view is not None,
-        )
+
+        def fill_graph_inputs() -> None:
+            self._fill_entry(
+                entry,
+                input_ids,
+                positions,
+                capture_metadata if capture_metadata is not None else metadata,
+                batch_size,
+                input_embedding,
+                input_batch,
+                verify_width=verify_width,
+                kpool_query_lens=kpool_query_lens,
+                local_expanded=expanded_view is not None,
+            )
+
+        if first_capture or not self.supports_draft_to_target_overlap:
+            fill_graph_inputs()
 
         prepare_context = ForwardContext(
             self.attention_backend,
@@ -1608,9 +1630,27 @@ class DecodeAclGraphRunner(BaseRunner):
             eplb=entry_eplb,
             execution_contexts=entry.execution_contexts,
         )
-        with forward_context(prepare_context):
-            self.attention_backend.prepare(entry.static_metadata, graph_mode=True)
-            if not first_capture:
+        pending_preparation = None
+        restore_history = (
+            getattr(self.model, "restore_engram_history", None) if self.supports_draft_to_target_overlap else None
+        )
+
+        def prepare_history() -> None:
+            if restore_history is not None:
+                restore_history(self.attention_backend, metadata)
+
+        def prepare_replay_metadata() -> None:
+            if first_capture:
+                return
+            with forward_context(prepare_context):
+                # The staging stream waits for the preceding compute before
+                # writing these persistent buffers. Keep their host preparation
+                # off the submission thread too, so replay can be queued while
+                # the draft is still running. The closure retains its sources
+                # until all copies have been submitted.
+                if self.supports_draft_to_target_overlap:
+                    fill_graph_inputs()
+                self.attention_backend.prepare(entry.static_metadata, graph_mode=True)
                 refresh_dsa = getattr(
                     self.attention_backend,
                     "refresh_dsa_metadata_for_graph_replay",
@@ -1618,66 +1658,100 @@ class DecodeAclGraphRunner(BaseRunner):
                 )
                 if refresh_dsa is not None:
                     refresh_dsa(entry.static_metadata)
-            # Host-offloaded engram tables: the graph only reads the staged
-            # rows, so the gather must run here -- once per step, outside the
-            # captured region (replay does not re-run Python). No-op models
-            # without the hook and non-offload configurations skip it: the hook
-            # existence is checked here so entry.static_input_ids / positions
-            # are not dereferenced at all for models without the hook (the
-            # helper's own early return happens after its arguments are
-            # evaluated, so it cannot protect this call site). The hook's return
-            # value is checked on an offload-active model: a False on a capture
-            # is refused by _engram_first_capture_gate before the graph is
-            # captured or cached (fail-fast, symmetric with the replay raise
-            # below), while a False on a replay is fail-fast -- the helper
-            # raises instead of letting the replay re-read the previous step's
-            # stale rows. Refusing (rather than caching an Engram-less graph)
-            # leaves the bucket re-capturable once staging recovers.
-            staged = False
-            if getattr(self.model, "stage_engram_rows_outside_graph", None) is not None:
-                staged = self._stage_engram_rows_outside_graph(
-                    entry.static_metadata,
-                    entry.static_input_ids,
-                    entry.static_positions,
-                    capturing=first_capture,
-                )
 
-        if first_capture:
-            self._engram_first_capture_gate(staged=staged)
-            self._capture(entry)
-            if capture_metadata is not None:
-                # Capture may still read the persistent indices. Order real
-                # metadata writes after it, then rebuild every derived table
-                # in the same storage before the first request replay.
-                torch.npu.current_stream().wait_stream(self._stream)
-                self._fill_entry(
-                    entry,
-                    input_ids,
-                    positions,
-                    metadata,
-                    batch_size,
-                    input_embedding,
-                    input_batch,
-                    verify_width=verify_width,
-                    kpool_query_lens=kpool_query_lens,
-                    local_expanded=expanded_view is not None,
-                )
-                with forward_context(prepare_context):
+        try:
+            with forward_context(prepare_context):
+                if first_capture:
                     self.attention_backend.prepare(entry.static_metadata, graph_mode=True)
-            # Register the entry only once the capture has actually succeeded.
-            # Registering before ``_capture`` would leave a half-built entry
-            # (``entry.graph is None``) cached under ``graph_key`` whenever the
-            # staging gate or ``_capture`` itself raises, and the next step for
-            # this bucket would take the replay branch and dereference
-            # ``entry.graph`` -> ``AttributeError``. Nothing between the
-            # ``_graphs.get`` lookup above and here reads the dict, so deferring
-            # the write is safe.
-            self._graphs[graph_key] = entry
+                async_stage = getattr(self.model, "stage_engram_rows_outside_graph_async", None)
+                if self.supports_draft_to_target_overlap and not first_capture and async_stage is not None:
+                    pending_preparation = async_stage(
+                        self.attention_backend,
+                        entry.static_metadata,
+                        entry.static_input_ids,
+                        entry.static_positions,
+                        prepare_metadata=prepare_replay_metadata,
+                        prepare_history=prepare_history,
+                    )
+                if pending_preparation is None:
+                    prepare_history()
+                    prepare_replay_metadata()
+                # Host-offloaded engram tables: the graph only reads the staged
+                # rows, so the gather must run here -- once per step, outside the
+                # captured region (replay does not re-run Python). No-op models
+                # without the hook and non-offload configurations skip it: the hook
+                # existence is checked here so entry.static_input_ids / positions
+                # are not dereferenced at all for models without the hook (the
+                # helper's own early return happens after its arguments are
+                # evaluated, so it cannot protect this call site). The hook's return
+                # value is checked on an offload-active model: a False on a capture
+                # is refused by _engram_first_capture_gate before the graph is
+                # captured or cached (fail-fast, symmetric with the replay raise
+                # below), while a False on a replay is fail-fast -- the helper
+                # raises instead of letting the replay re-read the previous step's
+                # stale rows. Refusing (rather than caching an Engram-less graph)
+                # leaves the bucket re-capturable once staging recovers.
+                staged = False
+                if getattr(self.model, "stage_engram_rows_outside_graph", None) is not None:
+                    if pending_preparation is not None:
+                        staged = True
+                    else:
+                        staged = self._stage_engram_rows_outside_graph(
+                            entry.static_metadata,
+                            entry.static_input_ids,
+                            entry.static_positions,
+                            capturing=first_capture,
+                        )
+
+            if first_capture:
+                self._engram_first_capture_gate(staged=staged)
+                self._capture(entry)
+                if capture_metadata is not None:
+                    # Capture may still read the persistent indices. Order real
+                    # metadata writes after it, then rebuild every derived table
+                    # in the same storage before the first request replay.
+                    torch.npu.current_stream().wait_stream(self._stream)
+                    self._fill_entry(
+                        entry,
+                        input_ids,
+                        positions,
+                        metadata,
+                        batch_size,
+                        input_embedding,
+                        input_batch,
+                        verify_width=verify_width,
+                        kpool_query_lens=kpool_query_lens,
+                        local_expanded=expanded_view is not None,
+                    )
+                    with forward_context(prepare_context):
+                        self.attention_backend.prepare(entry.static_metadata, graph_mode=True)
+                # Register the entry only once the capture has actually succeeded.
+                # Registering before ``_capture`` would leave a half-built entry
+                # (``entry.graph is None``) cached under ``graph_key`` whenever the
+                # staging gate or ``_capture`` itself raises, and the next step for
+                # this bucket would take the replay branch and dereference
+                # ``entry.graph`` -> ``AttributeError``. Nothing between the
+                # ``_graphs.get`` lookup above and here reads the dict, so deferring
+                # the write is safe.
+                self._graphs[graph_key] = entry
+        except BaseException:
+            release_inputs = getattr(self.model, "release_graph_inputs", None)
+            if first_capture and release_inputs is not None:
+                self._stream.synchronize()
+                if entry.graph is not None:
+                    entry.graph.reset()
+                release_inputs(entry.static_metadata)
+            raise
 
         # Besides ordering input updates, this wait protects the output view
         # returned by the previous replay.  The graph cannot overwrite its
         # static output until consumers queued on the current stream finish.
         self._stream.wait_stream(torch.npu.current_stream())
+        if pending_preparation is not None and pending_preparation.ready_event is not None:
+            # External events support waiting before the producer records.
+            # Submit the target now; its kernels start after the host lookup
+            # and H2D on the independent staging stream complete.
+            pending_preparation.ready_event.wait(self._stream)
         with torch.npu.stream(self._stream):
             entry.graph.replay()
             output = self._slice_output(
@@ -1685,6 +1759,13 @@ class DecodeAclGraphRunner(BaseRunner):
                 batch_size,
                 num_reqs=input_batch.num_reqs if input_batch is not None else None,
             )
+            replay_lifetime_event = None
+            if pending_preparation is not None:
+                replay_lifetime_event = torch.npu.Event()
+                replay_lifetime_event.record(self._stream)
+
+        if pending_preparation is not None:
+            self._pending_graph_preparations.append((pending_preparation, replay_lifetime_event))
 
         with torch.npu.stream(self._update_stream):
             self._update_stream.wait_event(self._replay_done_event)
@@ -1693,6 +1774,9 @@ class DecodeAclGraphRunner(BaseRunner):
         self._replay_done_event.record(self._stream)
 
         torch.npu.current_stream().wait_stream(self._stream)
+        if pending_preparation is not None:
+            # Surface a host lookup failure before returning any graph output.
+            pending_preparation.completion.result()
         return output
 
     def _stage_engram_rows_outside_graph(
@@ -2237,6 +2321,8 @@ class DecodeAclGraphRunner(BaseRunner):
                 )
                 entry.static_metadata.q_cu_host_values = list(range(padded_batch_size + 1))
                 entry.static_metadata.q_seq_lens = torch.full((n_groups,), w, dtype=torch.int32, device=device)
+                if self.supports_draft_to_target_overlap:
+                    entry.static_metadata.q_seq_lens_host_values = [w] * n_groups
                 entry.static_metadata.spec_group_width = w
             entry.static_metadata.expanded_decode_metadata = ExpandedDecodeMetadata(
                 kv_seq_lens=entry.kv_seq_lens_delta,
@@ -2333,15 +2419,44 @@ class DecodeAclGraphRunner(BaseRunner):
                 "KPool query-span layout changed for an existing ACL graph: "
                 f"captured={static_metadata.kpool_query_lens}, current={kpool_query_lens}"
             )
-        (
-            block_table,
-            kv_seq_lens,
-            kv_seq_lens_host_values,
-            paged_kv_indptr,
-            paged_kv_indices,
-            paged_kv_last_page_len,
-        ) = self._decode_metadata(metadata)
-        self._fill_graph_dsa_positions(entry, positions)
+        dsa_only = (
+            self.supports_draft_to_target_overlap
+            and self.attention_backend.graph_uses_dsa_metadata(static_metadata)
+            and not self.execution_metadata_builders
+        )
+        if dsa_only:
+            # CSA2 target uses host-derived DSA. Avoid a second paging form
+            # with no captured reader. Execution metadata builders retain the generic
+            # path because their attention-metadata dependencies are separate.
+            expanded = resolve_expanded_decode_metadata(metadata, block_size=self.attention_backend.page_size)
+            block_table = self._effective_block_table(metadata)
+            kv_seq_lens_host_values = (
+                expanded.kv_seq_lens_host_values
+                if expanded is not None
+                else getattr(metadata, "kv_seq_lens_host_values", None)
+            )
+            if block_table is None:
+                raise RuntimeError("DSA-only graph requires cache manager tables")
+        else:
+            (
+                block_table,
+                kv_seq_lens,
+                kv_seq_lens_host_values,
+                paged_kv_indptr,
+                paged_kv_indices,
+                paged_kv_last_page_len,
+            ) = self._decode_metadata(metadata)
+        graph_positions = (
+            self._stage_metadata_tensor(positions, input_ids.device, torch.int32)
+            if self.supports_draft_to_target_overlap
+            else positions.to(torch.int32).contiguous()
+        )
+        dsa_positions = (
+            positions
+            if not self.supports_draft_to_target_overlap or (dsa_only and positions.device == graph_positions.device)
+            else graph_positions
+        )
+        self._fill_graph_dsa_positions(entry, dsa_positions)
         if batch_size != block_table.shape[0]:
             raise RuntimeError("ACL graph decode batch size must match metadata sequences")
         slot_mapping = self._effective_slot_mapping(
@@ -2358,29 +2473,36 @@ class DecodeAclGraphRunner(BaseRunner):
         is_expanded = (
             local_expanded if local_expanded is not None else resolve_expanded_decode_metadata(metadata) is not None
         )
-        cumulative_kv_seq_lens = self._cumulative_lengths(
-            kv_seq_lens,
-            None if is_expanded else self._row_kv_cu_seq_lens(metadata, batch_size),
-        )
-        graph_positions = positions.to(torch.int32).contiguous()
-        kernels.update_decode_graph_metadata(
-            input_ids,
-            graph_positions,
-            slot_mapping,
-            cumulative_kv_seq_lens,
-            paged_kv_indptr,
-            paged_kv_indices,
-            paged_kv_last_page_len,
-            entry.static_input_ids,
-            entry.static_positions,
-            static_metadata.slot_mapping,
-            static_metadata.kv_cu_seq_lens,
-            entry.kv_seq_lens_delta,
-            static_metadata.paged_kv_indptr,
-            static_metadata.paged_kv_indices,
-            static_metadata.paged_kv_last_page_len,
-            padded_batch_size,
-        )
+        if dsa_only:
+            entry.static_input_ids[:batch_size].copy_(input_ids)
+            entry.static_positions[:batch_size].copy_(graph_positions)
+            static_metadata.slot_mapping[:batch_size].copy_(slot_mapping)
+            if padded_batch_size > batch_size:
+                entry.static_input_ids[batch_size:].zero_()
+                entry.static_positions[batch_size:].zero_()
+        else:
+            cumulative_kv_seq_lens = self._cumulative_lengths(
+                kv_seq_lens,
+                None if is_expanded else self._row_kv_cu_seq_lens(metadata, batch_size),
+            )
+            kernels.update_decode_graph_metadata(
+                input_ids,
+                graph_positions,
+                slot_mapping,
+                cumulative_kv_seq_lens,
+                paged_kv_indptr,
+                paged_kv_indices,
+                paged_kv_last_page_len,
+                entry.static_input_ids,
+                entry.static_positions,
+                static_metadata.slot_mapping,
+                static_metadata.kv_cu_seq_lens,
+                entry.kv_seq_lens_delta,
+                static_metadata.paged_kv_indptr,
+                static_metadata.paged_kv_indices,
+                static_metadata.paged_kv_last_page_len,
+                padded_batch_size,
+            )
         # linear_state_indices is filled once below (the robust
         # repeat_interleave slice path), together with has_initial_state, so
         # there is no first redundant fill here.
@@ -2405,7 +2527,7 @@ class DecodeAclGraphRunner(BaseRunner):
         elif entry.static_input_embedding is not None:
             entry.static_input_embedding.zero_()
 
-        if static_metadata.block_table is not None:
+        if static_metadata.block_table is not None and not dsa_only:
             src_bt = block_table
             copy_cols = min(
                 src_bt.shape[1],
@@ -2430,12 +2552,17 @@ class DecodeAclGraphRunner(BaseRunner):
             src_idx = getattr(metadata, "linear_state_indices", None)
             if src_idx is not None:
                 if src_idx.numel() >= batch_size:
-                    static_metadata.linear_state_indices[:batch_size].copy_(src_idx[:batch_size])
+                    src_idx = src_idx[:batch_size]
                 else:
                     width = batch_size // src_idx.numel()
-                    static_metadata.linear_state_indices[:batch_size].copy_(
-                        src_idx.repeat_interleave(width)[:batch_size]
+                    src_idx = src_idx.repeat_interleave(width)[:batch_size]
+                if self.supports_draft_to_target_overlap:
+                    src_idx = self._stage_metadata_tensor(
+                        src_idx,
+                        static_metadata.linear_state_indices.device,
+                        static_metadata.linear_state_indices.dtype,
                     )
+                static_metadata.linear_state_indices[:batch_size].copy_(src_idx)
             if padded_batch_size > batch_size:
                 static_metadata.linear_state_indices[batch_size:].zero_()
         if static_metadata.engram_lookback_token_ids is not None:
@@ -2457,7 +2584,12 @@ class DecodeAclGraphRunner(BaseRunner):
             if not static_metadata.is_dummy:
                 if src_accepted.ndim != 1 or not 0 < src_accepted.numel() <= batch_size:
                     raise ValueError("accepted-token metadata must contain one count per logical sequence")
-                static_accepted[: src_accepted.numel()].copy_(src_accepted.to(torch.int32))
+                src_accepted = (
+                    self._stage_metadata_tensor(src_accepted, static_accepted.device, torch.int32)
+                    if self.supports_draft_to_target_overlap
+                    else src_accepted.to(torch.int32)
+                )
+                static_accepted[: src_accepted.numel()].copy_(src_accepted)
         if static_metadata.has_initial_state is not None:
             src_his = getattr(metadata, "has_initial_state", None)
             if src_his is None:
@@ -2482,6 +2614,12 @@ class DecodeAclGraphRunner(BaseRunner):
                 if src_his.numel() < batch_size and src_his.numel() > 0 and batch_size % src_his.numel() == 0:
                     width = batch_size // src_his.numel()
                     src_his = src_his.repeat_interleave(width)
+                if self.supports_draft_to_target_overlap:
+                    src_his = self._stage_metadata_tensor(
+                        src_his,
+                        static_metadata.has_initial_state.device,
+                        static_metadata.has_initial_state.dtype,
+                    )
                 static_metadata.has_initial_state[:batch_size].copy_(src_his[:batch_size])
                 if padded_batch_size > batch_size:
                     static_metadata.has_initial_state[batch_size:].zero_()
@@ -2532,6 +2670,10 @@ class DecodeAclGraphRunner(BaseRunner):
             source = source.to(dtype=dtype).contiguous().pin_memory(device=device.type)
         return source.to(device=device, dtype=dtype, non_blocking=True).contiguous()
 
+    def _stage_block_table(self, block_table: torch.Tensor, device: torch.device) -> torch.Tensor:
+        """Stage host paging data without waiting for the preceding draft."""
+        return self._stage_metadata_tensor(block_table, device, torch.int32)
+
     def _fill_dsa_block_tables(
         self,
         static_metadata: _StaticAttentionMetadata,
@@ -2544,10 +2686,19 @@ class DecodeAclGraphRunner(BaseRunner):
         if not static_tables:
             return
         source_tables = list(getattr(metadata, "multi_block_tables", ()) or ())
+        static_metadata.multi_block_tables_host = None
+        host_only = self.supports_draft_to_target_overlap and self.attention_backend.graph_uses_dsa_metadata(
+            static_metadata
+        )
         if not source_tables:
             if getattr(metadata, "is_dummy", False):
-                for target in static_tables:
-                    target.zero_()
+                if not host_only:
+                    for target in static_tables:
+                        target.zero_()
+                if self.supports_draft_to_target_overlap:
+                    static_metadata.multi_block_tables_host = tuple(
+                        torch.zeros(target.shape, dtype=target.dtype) for target in static_tables
+                    )
                 return
             if getattr(self.attention_backend, "group_infos", None) is not None:
                 raise RuntimeError("DeepSeek-V4 ACL graph requires all DSA manager block tables")
@@ -2559,9 +2710,17 @@ class DecodeAclGraphRunner(BaseRunner):
             # the draft graph registers only its own SWA prefix.
             source_tables = source_tables[: len(static_tables)]
 
+        host_tables = (
+            []
+            if self.supports_draft_to_target_overlap
+            and all(source is not None and source.device.type == "cpu" for source in source_tables)
+            else None
+        )
+        host_only = host_only and host_tables is not None
         for manager_id, (target, source) in enumerate(zip(static_tables, source_tables, strict=True)):
             # Every graph padding row points at permanently reserved block 0.
-            target.zero_()
+            if not host_only:
+                target.zero_()
             if source is None:
                 continue
             if source.dim() != 2:
@@ -2581,6 +2740,24 @@ class DecodeAclGraphRunner(BaseRunner):
                 )
             group_infos = getattr(self.attention_backend, "group_infos", None)
             is_swa = group_infos is not None and group_infos[manager_id].cache_type == DSA_CACHE_SLIDING_WINDOW
+            if host_tables is not None:
+                # The DSA builder reads individual block IDs on the host.
+                # Preserve the scheduler data with exactly the graph's padded
+                # ring layout instead of reading the just-uploaded NPU table.
+                host_target = torch.zeros(target.shape, dtype=target.dtype)
+                if is_swa and source.shape[1] > 0:
+                    host_cols = torch.arange(target.shape[1]) % source.shape[1]
+                    host_target[:batch_size].copy_(source[:batch_size, host_cols])
+                else:
+                    host_target[:batch_size, : source.shape[1]].copy_(source[:batch_size])
+                host_tables.append(host_target)
+            if host_only:
+                # CSA2 refreshes its derived DSA tables from the host copy.
+                # Uploading the intermediate manager tables as well would
+                # write storage that no captured consumer reads.
+                continue
+            if self.supports_draft_to_target_overlap:
+                source = self._stage_block_table(source, target.device)
             if is_swa and source.shape[1] > 0:
                 # DSA interprets the table width as the physical ring period.
                 # Capacity padding must repeat that ring; zero-filled columns
@@ -2589,6 +2766,8 @@ class DecodeAclGraphRunner(BaseRunner):
                 target[:batch_size].copy_(source[:batch_size, cols])
             else:
                 target[:batch_size, : source.shape[1]].copy_(source[:batch_size])
+        if host_tables is not None:
+            static_metadata.multi_block_tables_host = tuple(host_tables)
 
     def _fill_graph_dsa_positions(
         self,
