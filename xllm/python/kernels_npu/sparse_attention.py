@@ -44,7 +44,14 @@ def pool_key_indexer(
     quant_mode: int = -1,
     sparse_indices_mode: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Run CANN's fused pool-key indexer for supported layouts."""
+    """Run CANN's fused pool-key indexer for supported layouts.
+
+    ``sparse_indices_mode`` selects the index layout of the appended tail:
+    0 keeps the legacy layout (tail at a fixed ``topk`` offset, with ``-1``
+    holes when fewer than ``topk / pool_size`` pools are valid), while 1 packs
+    the tail directly after the valid expanded indices so every ``-1`` stays
+    at the end of the row. Both modes select the same valid token set.
+    """
     if layout_q == "BSND":
         if query.dim() != 4 or query.size(-1) != 128 or query.numel() == 0:
             raise ValueError("query must have shape [B, S1, N1, 128]")
