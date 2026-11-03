@@ -327,6 +327,10 @@ def test_fused_pool_selection_does_not_materialize_history_mask(
     row_lengths = lengths if query_len == 1 else positions.reshape(-1) + 1
     assert calls[0]["query_shape"] == torch.Size([3 * query_len, 1, indexer.n_heads, indexer.head_dim])
     expected_tail = torch.remainder(row_lengths, 4).to(torch.int32).cpu()
+    if not always_select_tail:
+        # The dense path never appends the tail in this mode, and the compact
+        # kernel layout would otherwise place it inside the topk slice.
+        expected_tail = torch.zeros_like(expected_tail)
     expected_pools = torch.div(row_lengths, 4, rounding_mode="floor").to(torch.int32).cpu()
     torch.testing.assert_close(calls[0]["tail"].cpu(), expected_tail)
     torch.testing.assert_close(calls[0]["actual_seq_k"].cpu(), expected_pools)

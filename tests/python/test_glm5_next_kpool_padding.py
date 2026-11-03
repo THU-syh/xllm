@@ -48,18 +48,28 @@ def test_padding_keeps_row_identity_and_causal_lengths(query_len: int, monkeypat
     tables = torch.tensor([[1, 2], [3, 4]], dtype=torch.int32)
     lengths = positions[:, -1].to(torch.int32) + 1
     calls = []
+    expected_rows = torch.arange(rows)[mask.reshape(-1)]
+    identity = torch.arange(rows).reshape(2, query_len, 1, 1)
+    expanded = (identity * 4 + torch.arange(4)).expand(-1, -1, 2, -1).flatten(2)
+    counts = lengths[:, None] if query_len == 1 else positions + 1
+    tail = counts[..., None] // 4 * 4 + torch.arange(3)
+    tail = tail.masked_fill(torch.arange(3) >= counts[..., None] % 4, -1)
+    expected = torch.cat((expanded, tail), dim=-1)
+    expected[~mask] = -1
 
     def _kernel(
         q: torch.Tensor,
         cache: torch.Tensor,
         w: torch.Tensor,
-        tail: torch.Tensor,
+        tail_k: torch.Tensor,
         *args: object,
         **kwargs: object,
     ) -> tuple[torch.Tensor, None]:
-        identity = q[:, 0, 0, 0].long()
-        calls.append((identity, kwargs["actual_seq_k"] * 4, kwargs["block_table"]))
-        return identity[:, None, None].expand(-1, 1, 2).to(torch.int32), None
+        identity_tokens = q[:, 0, 0, 0].long()
+        calls.append((identity_tokens, kwargs["actual_seq_k"] * 4, kwargs["block_table"]))
+        # The kernel returns the expanded compact row; the mock mirrors the rows
+        # the test expects.
+        return expected.reshape(rows, -1)[expected_rows][:, None, :].to(torch.int32), None
 
     monkeypatch.setattr(glm5_next.kernels, "pool_key_indexer", _kernel, raising=False)
     result = indexer._select_topk_fused_pa(
@@ -74,18 +84,10 @@ def test_padding_keeps_row_identity_and_causal_lengths(query_len: int, monkeypat
     assert result is not None, "padding must remain on the fused path"
     assert result.shape == (2, query_len, 11)
     assert len(calls) == 1
-    expected_rows = torch.arange(rows)[mask.reshape(-1)]
     torch.testing.assert_close(calls[0][0], expected_rows)
     expected_lengths = lengths if query_len == 1 else positions.reshape(-1) + 1
     torch.testing.assert_close(calls[0][1], (expected_lengths[mask.reshape(-1)].to(torch.int32) // 4) * 4)
     torch.testing.assert_close(calls[0][2], tables[expected_rows // query_len])
-    identity = torch.arange(rows).reshape(2, query_len, 1, 1)
-    expanded = (identity * 4 + torch.arange(4)).expand(-1, -1, 2, -1).flatten(2)
-    counts = lengths[:, None] if query_len == 1 else positions + 1
-    tail = counts[..., None] // 4 * 4 + torch.arange(3)
-    tail = tail.masked_fill(torch.arange(3) >= counts[..., None] % 4, -1)
-    expected = torch.cat((expanded, tail), dim=-1)
-    expected[~mask] = -1
     torch.testing.assert_close(result, expected)
 
 
@@ -151,9 +153,7 @@ def test_real_npu_padding_matches_independent_causal_rows(monkeypatch: pytest.Mo
 @pytest.mark.skipif(not os.getenv("XLLM_KDA_TEST_NPU_DEVICE"), reason="NPU device not configured")
 @pytest.mark.parametrize("query_len", [1, 4])
 @torch.inference_mode()
-def test_real_npu_production_shape_matches_independent_rows(
-    monkeypatch: pytest.MonkeyPatch, query_len: int
-) -> None:
+def test_real_npu_production_shape_matches_independent_rows(monkeypatch: pytest.MonkeyPatch, query_len: int) -> None:
     pytest.importorskip("torch_npu")
     from xllm.python.kernels_npu.sparse_attention import pool_key_indexer
 
@@ -343,10 +343,10 @@ def test_non_divisible_topk_falls_back_to_dense(monkeypatch: pytest.MonkeyPatch)
 def test_short_rows_pack_tail_ahead_of_sentinels(monkeypatch: pytest.MonkeyPatch) -> None:
     """A short row must keep its tail tokens ahead of the ``-1`` holes.
 
-    ``topk=8 / index_kpool=4`` requests two pool ids; a row with only one complete
-    pool leaves the second slot ``-1``.  SFA stops consuming a row at its first
-    ``-1``, so the tail tokens appended after the expanded pools have to be packed
-    before those holes - otherwise the newest visible tokens are never attended.
+    ``topk=8 / index_kpool=4`` requests two pools; a row with only one complete
+    pool leaves the second slot ``-1``. The kernel's compact layout packs the
+    visible tail before that hole, which is what SFA needs because it stops
+    consuming a row at its first ``-1``.
     """
     indexer = _make_indexer(torch.device("cpu"))
     query = torch.zeros(2, 1, 1, 128, dtype=torch.bfloat16)
@@ -358,8 +358,8 @@ def test_short_rows_pack_tail_ahead_of_sentinels(monkeypatch: pytest.MonkeyPatch
 
     def _kernel(q: torch.Tensor, *args: object, **kwargs: object) -> tuple[torch.Tensor, None]:
         # One valid row after compaction: complete pool 0 (tokens 0..3), the
-        # second pool slot is unfilled because a 6-token row has one full pool.
-        return torch.tensor([[[0, -1]]], dtype=torch.int32), None
+        # visible tail tokens 4 and 5, then the -1 sentinels.
+        return torch.tensor([[[0, 1, 2, 3, 4, 5, -1, -1, -1, -1, -1]]], dtype=torch.int32), None
 
     monkeypatch.setattr(glm5_next.kernels, "pool_key_indexer", _kernel, raising=False)
     result = indexer._select_topk_fused_pa(
@@ -441,9 +441,7 @@ def test_real_npu_short_rows_pack_tail_before_sentinels(monkeypatch: pytest.Monk
 @pytest.mark.skipif(not os.getenv("XLLM_KDA_TEST_NPU_DEVICE"), reason="NPU device not configured")
 @pytest.mark.parametrize("graph_mode", [False, True])
 @torch.inference_mode()
-def test_real_npu_graph_matches_eager_result(
-    monkeypatch: pytest.MonkeyPatch, graph_mode: bool
-) -> None:
+def test_real_npu_graph_matches_eager_result(monkeypatch: pytest.MonkeyPatch, graph_mode: bool) -> None:
     """Real NPU: the ACL-graph path (``in_acl_graph``) matches eager results."""
     pytest.importorskip("torch_npu")
     from xllm.python.kernels_npu.sparse_attention import pool_key_indexer
@@ -486,11 +484,11 @@ def test_real_npu_graph_matches_eager_result(
 
 @torch.inference_mode()
 def test_padded_batch_packs_only_the_rows_with_empty_slots(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A mixed batch must keep the concatenated layout for rows without a -1 run.
+    """A mixed batch must keep the compact layout for every valid row.
 
-    ``topk=8 / index_kpool=4`` asks for two pool ids.  The 6-token row only has one
-    complete pool, so its second slot is ``-1`` and its tail has to be packed; the
-    40-token row fills both slots and keeps the plain concatenation.
+    ``topk=8 / index_kpool=4`` asks for two pools. The 6-token row only has one
+    complete pool, so its visible tail is packed before the ``-1`` hole; the
+    40-token row fills both pools and has no tail.
     """
     indexer = _make_indexer(torch.device("cpu"))
     query = torch.zeros(3, 1, 1, 128, dtype=torch.bfloat16)
@@ -501,9 +499,15 @@ def test_padded_batch_packs_only_the_rows_with_empty_slots(monkeypatch: pytest.M
     tables = torch.tensor([[1, 2], [3, 4], [5, 6]], dtype=torch.int32)
 
     def _kernel(q: torch.Tensor, *args: object, **kwargs: object) -> tuple[torch.Tensor, None]:
-        # row 0 (6 tokens): one complete pool -> second slot empty.
-        # row 1 (40 tokens): ten complete pools -> both slots filled.
-        return torch.tensor([[[0, -1]], [[0, 1]]], dtype=torch.int32), None
+        # row 0 (6 tokens): one complete pool + tail tokens 4 and 5.
+        # row 1 (40 tokens): two filled pools, no tail.
+        return torch.tensor(
+            [
+                [[0, 1, 2, 3, 4, 5, -1, -1, -1, -1, -1]],
+                [[0, 1, 2, 3, 4, 5, 6, 7, -1, -1, -1]],
+            ],
+            dtype=torch.int32,
+        ), None
 
     monkeypatch.setattr(glm5_next.kernels, "pool_key_indexer", _kernel, raising=False)
     result = indexer._select_topk_fused_pa(
