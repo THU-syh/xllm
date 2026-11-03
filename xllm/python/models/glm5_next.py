@@ -121,6 +121,10 @@ from xllm.python.layers.linear import ColumnParallelLinear
 from xllm.python.layers.moe_parallel import TokenParallelLayout, dp_gather_tokens, reduce_and_scatter
 from xllm.python.layers.qlinear import QLinear, QLinearWeightLoader
 from xllm.python.models.aux_hidden_capture import AuxHiddenCapture
+from scripts.logger import logger
+
+# Warn once per process: Glm5NextIndexer is built once per layer.
+_fused_kpool_warned = False
 from xllm.python.models.base import PyModelBase
 from xllm.python.models.glm5_next_kpool import (
     append_causal_tail,
@@ -993,6 +997,20 @@ class Glm5NextIndexer(nn.Module):
         self.index_kpool = cfg.index_kpool
         self.index_kpool_compress = cfg.index_kpool_compress
         self.index_kpool_always_select_tail = cfg.index_kpool_always_select_tail
+        # The fused PA_BBND kernel requires topk % pool_size == 0, and the padded
+        # (compacted) path derives its pool count as topk // index_kpool, so a
+        # non-divisible topk cannot use the fused path. Keep such configurations
+        # on the dense indexer (which selects pools itself) rather than failing
+        # at construction, so existing configs keep loading.
+        self._fused_kpool_disabled = self.index_kpool > 0 and self.topk % self.index_kpool != 0
+        if self._fused_kpool_disabled:
+            global _fused_kpool_warned
+            if not _fused_kpool_warned:
+                _fused_kpool_warned = True
+                logger.warning(
+                    f"index_topk ({self.topk}) is not divisible by index_kpool "
+                    f"({self.index_kpool}); using the dense kPool indexer."
+                )
         self._uses_npu_compressed_tail = (
             device.type in ("npu", "privateuseone")
             and self.index_kpool > 1
@@ -1113,7 +1131,8 @@ class Glm5NextIndexer(nn.Module):
         """Run PoolKeyIndexer through the paged PA_BBND pool cache."""
         if pool_cache.dtype != query.dtype:
             return None
-        if not in_acl_graph() and not bool(attention_mask.all().item()):
+        if self._fused_kpool_disabled:
+            # topk % index_kpool != 0 cannot be expressed by the fused kernel.
             return None
 
         batch_size, query_len = query.shape[:2]
@@ -1144,17 +1163,47 @@ class Glm5NextIndexer(nn.Module):
                 fused_block_table = (
                     pool_block_table[:, None, :].expand(batch_size, query_len, -1).reshape(batch_size * query_len, -1)
                 )
+        valid_rows = None
+        if not in_acl_graph() and not bool(attention_mask.all().item()):
+            # The fused kernel consumes one query per row. Exclude padding
+            # before execution, then restore its sentinel rows in logical order.
+            # The compacted path below cannot express the partial tail pool, so
+            # it is only entered when the tail is always selected; otherwise keep
+            # the dense fallback (which handles the tail explicitly) so that
+            # padded batches never silently drop the most recent tokens.
+            if not self.index_kpool_always_select_tail:
+                return None
+            valid_rows = attention_mask.reshape(-1).nonzero(as_tuple=True)[0]
+            if valid_rows.numel() == 0:
+                return torch.full(
+                    (batch_size, query_len, self.topk_output_width),
+                    -1,
+                    dtype=torch.long,
+                    device=query.device,
+                )
+            fused_query = fused_query.index_select(0, valid_rows)
+            fused_weights = fused_weights.index_select(0, valid_rows)
+            token_count = token_count.index_select(0, valid_rows)
+            fused_block_table = fused_block_table.index_select(0, valid_rows)
         # PA_BBND addresses complete pooled keys and uses pool_tail_k for the
-        # remaining tokens in the current tail pool.
+        # remaining tokens in the current tail pool. ``actual_seq_k`` is the
+        # number of *complete* pools, so ``actual_seq_k * index_kpool`` is the
+        # token offset where the partial tail pool starts and ``pool_tail_k``
+        # (token_count % index_kpool) is the number of causally visible tokens
+        # inside it.
         pool_tail_k = torch.remainder(token_count, self.index_kpool).to(torch.int32).contiguous()
         actual_seq_k = torch.div(token_count, self.index_kpool, rounding_mode="floor").to(torch.int32).contiguous()
+        # The compacted call below uses index_kpool == 1, where every pool holds a
+        # single token; the partial-tail remainder is therefore identically zero
+        # (token_count % 1 == 0), so passing zeros is exactly what the kernel
+        # would derive from pool_size == 1. The tail is appended separately.
         indices, _ = kernels.pool_key_indexer(
             fused_query,
             pool_cache,
             fused_weights,
-            pool_tail_k,
-            self.topk,
-            self.index_kpool,
+            pool_tail_k if valid_rows is None else torch.zeros_like(pool_tail_k),
+            self.topk if valid_rows is None else self.topk // self.index_kpool,
+            self.index_kpool if valid_rows is None else 1,
             return_value=False,
             actual_seq_k=actual_seq_k,
             # The DCP-expanded indexer table carries -1 for logical blocks that are not
@@ -1167,8 +1216,60 @@ class Glm5NextIndexer(nn.Module):
         )
 
         output_width = self.topk_output_width
-        indices = indices.reshape(batch_size, query_len, -1)[..., :output_width]
-        return indices.masked_fill(~attention_mask[..., None], -1).long()
+        if valid_rows is None:
+            # Preserve the existing unpadded and graph execution paths.
+            indices = indices.reshape(batch_size, query_len, -1)[..., :output_width]
+            return indices.masked_fill(~attention_mask[..., None], -1).long()
+        # Select pool ids without the kernel's scalar token expansion.
+        # Expand only the compacted eager rows, then append causally visible
+        # tokens from each incomplete tail pool.
+        pool_indices = indices.reshape(fused_query.shape[0], -1)
+        offsets = torch.arange(self.index_kpool, dtype=torch.int32, device=query.device)
+        # pool_key_indexer returns topk // index_kpool pool ids per row and fills
+        # the slots a row cannot cover with -1 (a row with only k complete pools
+        # leaves the remaining slots empty). Expanding every pool id into
+        # index_kpool token ids therefore turns those slots into runs of -1.
+        empty_slots = pool_indices < 0
+        expanded_indices = (pool_indices[..., None] * self.index_kpool + offsets).masked_fill(
+            empty_slots[..., None], -1
+        )
+        # SFA stops reading a row at its first -1, so a row whose -1 run comes
+        # before the partial tail would never attend its newest tokens. Only those
+        # rows need the tail packed (glm5_next_kpool.append_causal_tail moves every
+        # valid token ahead of the -1 run and takes the last visible *position*,
+        # hence token_count - 1). Rows that fill every pool slot have no -1 run and
+        # only need the tail appended, which skips the full-width sort that packing
+        # a long-context batch would otherwise cost.
+        tail_offsets = torch.arange(self.index_kpool - 1, dtype=torch.int32, device=query.device)
+        tail_indices = actual_seq_k[:, None] * self.index_kpool + tail_offsets
+        tail_indices = tail_indices.masked_fill(tail_offsets >= pool_tail_k[:, None], -1)
+        compact_indices = torch.cat((expanded_indices.flatten(1), tail_indices), dim=-1)
+        # Only the rows that actually have a -1 run need the packed layout; the
+        # rest keep the concatenation above, so the sort stays proportional to the
+        # short rows instead of the whole batch.
+        hole_rows = empty_slots.any(-1).nonzero(as_tuple=True)[0]
+        if hole_rows.numel() > 0:
+            packed_indices = append_causal_tail(
+                expanded_indices.index_select(0, hole_rows).flatten(1).unsqueeze(1),
+                (token_count.index_select(0, hole_rows).to(torch.int64) - 1).unsqueeze(-1),
+                self.index_kpool,
+            ).squeeze(1)
+            compact_indices.index_copy_(0, hole_rows, packed_indices.to(compact_indices.dtype))
+        # append_causal_tail appends exactly index_kpool - 1 tail slots and lets
+        # torch.cat promote the mixed int32/int64 inputs to int64, so the
+        # compacted width equals topk + index_kpool - 1 == topk_output_width by
+        # contract; the assertion documents that cross-module dependency.
+        assert compact_indices.shape[-1] == output_width, (
+            f"compacted width {compact_indices.shape[-1]} != topk_output_width {output_width}"
+        )
+        restored_indices = torch.full(
+            (batch_size * query_len, output_width),
+            -1,
+            dtype=torch.long,
+            device=query.device,
+        )
+        restored_indices.index_copy_(0, valid_rows, compact_indices.long())
+        return restored_indices.reshape(batch_size, query_len, output_width)
 
     @property
     def topk_output_width(self) -> int:
