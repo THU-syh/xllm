@@ -61,7 +61,6 @@ try:
 except ImportError:
     torch_npu = None  # type: ignore[assignment]
 
-from scripts.logger import logger
 from xllm.python import distributed, kernels
 from xllm.python.attention.backend import MlaIndexContext
 from xllm.python.attention.kda_linear_attention import kda_cp_prefill_eligible
@@ -122,6 +121,7 @@ from xllm.python.layers.linear import ColumnParallelLinear
 from xllm.python.layers.moe_parallel import TokenParallelLayout, dp_gather_tokens, reduce_and_scatter
 from xllm.python.layers.qlinear import QLinear, QLinearWeightLoader
 from xllm.python.models.aux_hidden_capture import AuxHiddenCapture
+from scripts.logger import logger
 
 # Warn once per process: Glm5NextIndexer is built once per layer.
 _fused_kpool_warned = False
