@@ -385,10 +385,15 @@ def test_fused_pool_selection_mtp_preserves_causal_tail_across_pool_boundary(
 
 @pytest.mark.skipif(not os.getenv("XLLM_KDA_TEST_NPU_DEVICE"), reason="NPU device not configured")
 @torch.inference_mode()
-def test_fused_pool_selection_compact_indices_leave_no_interior_holes() -> None:
+def test_fused_pool_selection_compact_indices_leave_no_interior_holes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     pytest.importorskip("torch_npu")
+    from xllm.python.kernels_npu.sparse_attention import pool_key_indexer
+
     device = torch.device(os.environ["XLLM_KDA_TEST_NPU_DEVICE"])
     torch.npu.set_device(device)
+    monkeypatch.setattr(glm5_next.kernels, "pool_key_indexer", pool_key_indexer, raising=False)
     indexer = _indexer(device)
     indexer.index_kpool_always_select_tail = True
 
