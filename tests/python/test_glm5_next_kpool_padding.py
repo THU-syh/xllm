@@ -292,7 +292,9 @@ def test_padding_without_tail_selection_stays_fused_with_zero_tail(monkeypatch: 
         **_kwargs: object,
     ) -> tuple[torch.Tensor, None]:
         calls.append((tail.clone(), topk, pool_size))
-        return torch.arange(8, dtype=torch.int32).reshape(1, 1, 8), None
+        # The compact kernel always returns topk + pool_size - 1 columns; the
+        # caller slices 8 for this no-tail configuration.
+        return torch.tensor([[[0, 1, 2, 3, 4, 5, 6, 7, -1, -1, -1]]], dtype=torch.int32), None
 
     monkeypatch.setattr(glm5_next.kernels, "pool_key_indexer", _kernel, raising=False)
     result = indexer._select_topk_fused_pa(

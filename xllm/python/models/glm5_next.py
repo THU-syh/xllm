@@ -1218,6 +1218,14 @@ class Glm5NextIndexer(nn.Module):
             sparse_indices_mode=1,
         )
 
+        # The compact kernel returns topk + pool_size - 1 columns: the selected
+        # pools expanded to tokens plus the partial tail. Assert the contract
+        # explicitly so a schema/layout drift cannot be silently truncated by
+        # the slice below (the output width differs when tail selection is off).
+        expected_kernel_width = self.topk + self.index_kpool - 1
+        assert indices.shape[-1] == expected_kernel_width, (
+            f"pool_key_indexer returned width {indices.shape[-1]}, expected {expected_kernel_width}"
+        )
         output_width = self.topk_output_width
         if valid_rows is None:
             # Preserve the existing unpadded and graph execution paths.
