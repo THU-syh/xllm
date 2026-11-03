@@ -301,6 +301,7 @@ def test_fused_pool_selection_does_not_materialize_history_mask(
                 kwargs["actual_seq_k"],
                 kwargs["block_table"].shape,
                 kwargs["mask_mode"],
+                kwargs["sparse_indices_mode"],
             )
         )
         return output, None
@@ -331,6 +332,7 @@ def test_fused_pool_selection_does_not_materialize_history_mask(
     torch.testing.assert_close(calls[0][2].cpu(), expected_pools)
     assert calls[0][3] == torch.Size([3 * query_len, 2048])
     assert calls[0][4] == 3
+    assert calls[0][5] == 1
     output_width = 11 if always_select_tail else 8
     torch.testing.assert_close(actual, output.reshape(3, query_len, -1)[..., :output_width].long())
 
@@ -379,6 +381,36 @@ def test_fused_pool_selection_mtp_preserves_causal_tail_across_pool_boundary(
             valid = actual[batch_idx, query_idx]
             valid = valid[valid >= 0].sort().values.cpu()
             torch.testing.assert_close(valid, torch.tensor(list(expected_row), dtype=torch.int64))
+
+
+@pytest.mark.skipif(not os.getenv("XLLM_KDA_TEST_NPU_DEVICE"), reason="NPU device not configured")
+@torch.inference_mode()
+def test_fused_pool_selection_compact_indices_leave_no_interior_holes() -> None:
+    pytest.importorskip("torch_npu")
+    device = torch.device(os.environ["XLLM_KDA_TEST_NPU_DEVICE"])
+    torch.npu.set_device(device)
+    indexer = _indexer(device)
+    indexer.index_kpool_always_select_tail = True
+
+    # index_topk=8 and index_kpool=4 select at most two pools, so a 5-token
+    # row has one complete pool plus one tail token. The legacy layout leaves
+    # four -1 holes before the tail; compact must keep the row contiguous.
+    query = torch.ones(1, 1, indexer.n_heads, indexer.head_dim, device=device, dtype=torch.bfloat16)
+    weights = torch.ones(1, 1, indexer.n_heads, device=device, dtype=torch.bfloat16)
+    lengths = torch.tensor([5], device=device, dtype=torch.int32)
+    mask = torch.ones(1, 1, device=device, dtype=torch.bool)
+    cache = torch.zeros(1, 16, 1, indexer.head_dim, device=device, dtype=torch.bfloat16)
+    tables = torch.tensor([[0]], device=device, dtype=torch.int32)
+
+    actual = indexer._select_topk_fused_pa(query, weights, lengths, mask, cache, tables)
+    assert actual is not None
+
+    row = actual[0, 0]
+    valid = row[row >= 0]
+    assert valid.numel() == 5
+    first_invalid = (row < 0).nonzero()[0].item()
+    assert first_invalid == valid.numel(), "compact indices must not leave interior -1 holes"
+    torch.testing.assert_close(valid.cpu(), torch.tensor([0, 1, 2, 3, 4], dtype=torch.int64))
 
 
 def test_compressed_kpool_completes_pool_across_forward_boundary() -> None:
