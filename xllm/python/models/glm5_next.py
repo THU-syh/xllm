@@ -61,6 +61,7 @@ try:
 except ImportError:
     torch_npu = None  # type: ignore[assignment]
 
+from scripts.logger import logger
 from xllm.python import distributed, kernels
 from xllm.python.attention.backend import MlaIndexContext
 from xllm.python.attention.kda_linear_attention import kda_cp_prefill_eligible
@@ -116,7 +117,6 @@ def _compact_kpool_triton_query_len(
 # (= kv_len / index_kpool): 8 GiB at 32K context, 16 GiB at 64K — beyond the
 # activation headroom and a hard device OOM mid prefill.
 _SCORES_SLAB_CAP_BYTES = int(1.5 * 1024**3)
-from scripts.logger import logger
 from xllm.python.layers.embedding import HiddenParallelEmbedding
 from xllm.python.layers.linear import ColumnParallelLinear
 from xllm.python.layers.moe_parallel import TokenParallelLayout, dp_gather_tokens, reduce_and_scatter
