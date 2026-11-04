@@ -844,6 +844,55 @@ def _lightning_indexer_fake(
     return query.new_zeros(out_shape, dtype=torch.int32)
 
 
+def _pool_key_indexer_fake(
+    query: torch.Tensor,
+    pool_key: torch.Tensor,
+    weights: torch.Tensor,
+    pool_tail_k: torch.Tensor,
+    topk: int,
+    pool_size: int,
+    return_value: bool = False,
+    q_descale: torch.Tensor | None = None,
+    k_descale: torch.Tensor | None = None,
+    actual_seq_q: torch.Tensor | None = None,
+    actual_seq_k: torch.Tensor | None = None,
+    block_table: torch.Tensor | None = None,
+    layout_q: str = "BSND",
+    layout_k: str = "BSND",
+    mask_mode: int = 3,
+    quant_mode: int = -1,
+    sparse_indices_mode: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    del (
+        pool_key,
+        weights,
+        pool_tail_k,
+        q_descale,
+        k_descale,
+        actual_seq_q,
+        actual_seq_k,
+        block_table,
+        layout_k,
+        mask_mode,
+        quant_mode,
+        sparse_indices_mode,
+    )
+    indices_len = topk + pool_size - 1
+    values_len = topk // pool_size
+    if layout_q == "BSND":
+        indices_shape = (query.size(0), query.size(1), indices_len)
+        values_shape = (query.size(0), query.size(1), values_len)
+    else:
+        indices_shape = (query.size(0), indices_len)
+        values_shape = (query.size(0), values_len)
+    indices = query.new_empty(indices_shape, dtype=torch.int32)
+    if return_value:
+        values = query.new_empty(values_shape, dtype=torch.float32)
+    else:
+        values = query.new_empty((0,), dtype=torch.float32)
+    return indices, values
+
+
 def _lightning_indexer_out_fake(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -1429,6 +1478,7 @@ register_fake(
 )
 register_fake("xllm_ops::lightning_indexer", _lightning_indexer_fake)
 register_fake("xllm_ops::lightning_indexer_out", _lightning_indexer_out_fake)
+register_fake("xllm_ops::pool_key_indexer", _pool_key_indexer_fake)
 register_fake("xllm_ops::scatter_nd_update", _scatter_nd_update_fake)
 register_fake("xllm_ops::rms_norm_dynamic_quant", _rms_norm_dynamic_quant_fake)
 register_fake("xllm_ops::rms_norm_cast_va", _rms_norm_cast_va_fake)

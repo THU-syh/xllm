@@ -20,6 +20,7 @@ cc_library(
     hc_post.cpp
     quant_lightning_indexer.cpp
     lightning_indexer.cpp
+    pool_key_indexer.cpp
     hc_pre_inv_rms.cpp
     hc_pre_sinkhorn.cpp
     hc_pre.cpp

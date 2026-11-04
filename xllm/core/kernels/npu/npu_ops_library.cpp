@@ -1006,6 +1006,13 @@ TORCH_LIBRARY(xllm_ops, m) {
       "Tensor(a!) sparse_indices_out, Tensor(b!) sparse_values_out) -> "
       "Tensor(a!)");
   m.def(
+      "pool_key_indexer(Tensor query, Tensor pool_key, Tensor weights, Tensor "
+      "pool_tail_k, int topk, int pool_size, bool return_value=False, Tensor? "
+      "q_descale=None, Tensor? k_descale=None, Tensor? actual_seq_q=None, "
+      "Tensor? actual_seq_k=None, Tensor? block_table=None, str "
+      "layout_q='BSND', str layout_k='BSND', int mask_mode=3, int "
+      "quant_mode=-1, int sparse_indices_mode=0) -> (Tensor, Tensor)");
+  m.def(
       "scatter_nd_update(Tensor(a!) var, Tensor indices, Tensor updates) -> "
       "()");
   m.def(
@@ -1177,6 +1184,7 @@ TORCH_LIBRARY_IMPL(xllm_ops, PrivateUse1, m) {
   m.impl("lightning_indexer", TORCH_FN(xllm::kernel::npu::lightning_indexer));
   m.impl("lightning_indexer_out",
          TORCH_FN(xllm::kernel::npu::lightning_indexer_out));
+  m.impl("pool_key_indexer", TORCH_FN(xllm::kernel::npu::pool_key_indexer));
   m.impl("scatter_nd_update", TORCH_FN(xllm::kernel::npu::scatter_nd_update));
   m.impl("x_flash_attention_decode_out",
          TORCH_FN(xllm::kernel::npu::x_flash_attention_decode_out));

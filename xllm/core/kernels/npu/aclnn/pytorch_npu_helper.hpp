@@ -794,3 +794,92 @@ using ReleaseHugeMemFn = void (*)(void*, bool);
       uninit_mem_func(nullptr, false);                                         \
     }                                                                          \
   } while (false)
+
+// Variant for ACLNN entries whose workspace-size and run functions do not
+// share the "<api>GetWorkspaceSize"/"<api>" naming convention (e.g. the
+// Tensor value-input variants such as aclnnPoolKeyIndexerV2Tensor).
+#define EXEC_NPU_CMD_NAMED(aclnn_gws_api, aclnn_run_api, ...)                  \
+  do {                                                                         \
+    static const auto get_workspace_size_func_addr =                           \
+        ::xllm::kernel::npu::aclnn::detail::get_op_api_func_addr(              \
+            #aclnn_gws_api);                                                   \
+    static const auto op_api_func_addr =                                       \
+        ::xllm::kernel::npu::aclnn::detail::get_op_api_func_addr(              \
+            #aclnn_run_api);                                                   \
+    static const auto init_mem_addr =                                          \
+        ::xllm::kernel::npu::aclnn::detail::get_op_api_func_addr(              \
+            "InitHugeMemThreadLocal");                                         \
+    static const auto uninit_mem_addr =                                        \
+        ::xllm::kernel::npu::aclnn::detail::get_op_api_func_addr(              \
+            "UnInitHugeMemThreadLocal");                                       \
+    static const auto release_mem_addr =                                       \
+        ::xllm::kernel::npu::aclnn::detail::get_op_api_func_addr(              \
+            "ReleaseHugeMem");                                                 \
+    CHECK(get_workspace_size_func_addr != nullptr &&                           \
+          op_api_func_addr != nullptr)                                         \
+        << #aclnn_gws_api << " or " << #aclnn_run_api << " not in "            \
+        << ::xllm::kernel::npu::aclnn::detail::get_op_api_lib_name()           \
+        << ", or "                                                             \
+        << ::xllm::kernel::npu::aclnn::detail::get_op_api_lib_name()           \
+        << "not found.";                                                       \
+    auto acl_stream = c10_npu::getCurrentNPUStream().stream(false);            \
+    uint64_t workspace_size = 0;                                               \
+    uint64_t* workspace_size_addr = &workspace_size;                           \
+    ::aclOpExecutor* executor = nullptr;                                       \
+    ::aclOpExecutor** executor_addr = &executor;                               \
+    ::xllm::kernel::npu::aclnn::detail::InitHugeMemThreadLocalFn               \
+        init_mem_func = reinterpret_cast<                                      \
+            ::xllm::kernel::npu::aclnn::detail::InitHugeMemThreadLocalFn>(     \
+            init_mem_addr);                                                    \
+    ::xllm::kernel::npu::aclnn::detail::UnInitHugeMemThreadLocalFn             \
+        uninit_mem_func = reinterpret_cast<                                    \
+            ::xllm::kernel::npu::aclnn::detail::UnInitHugeMemThreadLocalFn>(   \
+            uninit_mem_addr);                                                  \
+    if (init_mem_func) {                                                       \
+      init_mem_func(nullptr, false);                                           \
+    }                                                                          \
+    auto converted_params = ::xllm::kernel::npu::aclnn::detail::convert_types( \
+        __VA_ARGS__, workspace_size_addr, executor_addr);                      \
+    static auto get_workspace_size_func =                                      \
+        ::xllm::kernel::npu::aclnn::detail::convert_to_op_api_func(            \
+            converted_params, get_workspace_size_func_addr);                   \
+    auto workspace_status = ::xllm::kernel::npu::aclnn::detail::call(          \
+        get_workspace_size_func, converted_params);                            \
+    CHECK(workspace_status == 0)                                               \
+        << "call " #aclnn_gws_api " failed, detail:" << aclGetRecentErrMsg();  \
+    void* workspace_addr = nullptr;                                            \
+    at::Tensor workspace_tensor;                                               \
+    if (workspace_size != 0) {                                                 \
+      at::TensorOptions options =                                              \
+          at::TensorOptions(torch_npu::utils::get_npu_device_type());          \
+      workspace_tensor = at::empty({static_cast<int64_t>(workspace_size)},     \
+                                   options.dtype(at::kByte));                  \
+      workspace_addr = const_cast<void*>(workspace_tensor.storage().data());   \
+    }                                                                          \
+    auto acl_call = [=]() -> int {                                             \
+      using OpApiFunc =                                                        \
+          int (*)(void*, uint64_t, ::aclOpExecutor*, const aclrtStream);       \
+      OpApiFunc op_api_func = reinterpret_cast<OpApiFunc>(op_api_func_addr);   \
+      auto api_ret =                                                           \
+          op_api_func(workspace_addr, workspace_size, executor, acl_stream);   \
+      CHECK(api_ret == 0) << "call " #aclnn_run_api " failed, detail:"         \
+                          << aclGetRecentErrMsg();                             \
+      ::xllm::kernel::npu::aclnn::detail::release_convert_types(               \
+          converted_params);                                                   \
+      ::xllm::kernel::npu::aclnn::detail::ReleaseHugeMemFn release_mem_func =  \
+          reinterpret_cast<                                                    \
+              ::xllm::kernel::npu::aclnn::detail::ReleaseHugeMemFn>(           \
+              release_mem_addr);                                               \
+      if (release_mem_func) {                                                  \
+        release_mem_func(nullptr, false);                                      \
+      }                                                                        \
+      return api_ret;                                                          \
+    };                                                                         \
+    at_npu::native::OpCommand cmd;                                             \
+    cmd.Name(#aclnn_run_api);                                                  \
+    cmd.SetCustomHandler(acl_call);                                            \
+    cmd.Run();                                                                 \
+    if (uninit_mem_func) {                                                     \
+      uninit_mem_func(nullptr, false);                                         \
+    }                                                                          \
+  } while (false)

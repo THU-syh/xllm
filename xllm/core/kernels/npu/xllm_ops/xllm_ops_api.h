@@ -245,6 +245,26 @@ torch::Tensor lightning_indexer_out(
     bool return_value,
     torch::Tensor& sparse_indices_out,
     torch::Tensor& sparse_values_out);
+
+std::tuple<torch::Tensor, torch::Tensor> pool_key_indexer(
+    const torch::Tensor& query,
+    const torch::Tensor& pool_key,
+    const torch::Tensor& weights,
+    const torch::Tensor& pool_tail_k,
+    int64_t topk,
+    int64_t pool_size,
+    bool return_value,
+    const c10::optional<torch::Tensor>& q_descale,
+    const c10::optional<torch::Tensor>& k_descale,
+    const c10::optional<torch::Tensor>& actual_seq_q,
+    const c10::optional<torch::Tensor>& actual_seq_k,
+    const c10::optional<torch::Tensor>& block_table,
+    c10::string_view layout_q,
+    c10::string_view layout_k,
+    int64_t mask_mode,
+    int64_t quant_mode,
+    int64_t sparse_indices_mode);
+
 at::Tensor hc_pre_inv_rms(const at::Tensor& x, double epsilon);
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> gamma_add_rms_norm(

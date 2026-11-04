@@ -18,11 +18,6 @@ from __future__ import annotations
 
 import torch
 
-try:
-    import cann_ops_transformer  # noqa: F401
-except ImportError:
-    cann_ops_transformer = None
-
 
 def pool_key_indexer(
     query: torch.Tensor,
@@ -173,11 +168,7 @@ def pool_key_indexer(
         raise ValueError("pool_size must be in [1, 128]")
     if topk < 1 or topk > 8192 or topk % pool_size != 0:
         raise ValueError("topk must be in [1, 8192] and divisible by pool_size")
-    try:
-        op = torch.ops.cann_ops_transformer.pool_key_indexer
-    except (AttributeError, RuntimeError) as exc:
-        raise NotImplementedError("CANN pool_key_indexer is unavailable in this runtime") from exc
-    return op(
+    return torch.ops.xllm_ops.pool_key_indexer(
         query,
         pool_key,
         weights,
